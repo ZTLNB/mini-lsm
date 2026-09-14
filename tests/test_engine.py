@@ -358,11 +358,22 @@ class TestStats(EngineTestCase):
             self.assertEqual(s.memtable_entries, 2)     # 墓碑也算一条
             self.assertEqual(s.tombstones, 1)
 
-    def test_flush_pending_when_memtable_full(self):
-        with self.open_engine(memtable_capacity=100) as db:
+    def test_flush_pending_when_auto_flush_disabled(self):
+        """关掉自动刷盘时,内存表满了就该报"待刷盘"。"""
+        with self.open_engine(memtable_capacity=100, auto_flush=False) as db:
             db.put("k1", "v")
             db.put("k2", "v")
             self.assertTrue(db.stats().flush_pending)
+
+    def test_auto_flush_empties_memtable(self):
+        """开着自动刷盘时,内存表满了会被立刻刷走,所以不再"待刷盘"。"""
+        with self.open_engine(memtable_capacity=100) as db:
+            db.put("k1", "v")
+            db.put("k2", "v")
+            stats = db.stats()
+            self.assertFalse(stats.flush_pending)
+            self.assertEqual(stats.sstable_count, 1)
+            self.assertEqual(stats.memtable_entries, 0)
 
     def test_usage_ratio(self):
         with self.open_engine(memtable_capacity=1000) as db:

@@ -1,6 +1,8 @@
 """mini-lsm —— 从零实现的 LSM-Tree 存储引擎。
 
-阶段 1 已实现:WAL 预写日志 + MemTable 内存表 + 崩溃恢复。
+已完成:
+    阶段 1  WAL 预写日志 + MemTable 内存表 + 崩溃恢复
+    阶段 2  SSTable 刷盘 + 多来源读路径(数据量不再受内存限制)
 
 快速开始::
 
@@ -16,9 +18,12 @@
 
         for key, value in db.scan(b"a", b"z"):
             print(key, value)
+
+数据目录里会有 ``wal.log`` 和若干 ``sst-*.sst``。
+内存表写满后自动刷成 SSTable,所以数据量可以远超内存。
 """
 
-from .engine import EngineStats, LSMEngine, to_bytes
+from .engine import WAL_FILENAME, EngineStats, LSMEngine, to_bytes
 from .errors import (
     ChecksumMismatchError,
     ClosedError,
@@ -27,28 +32,73 @@ from .errors import (
     LSMError,
     TruncatedRecordError,
 )
+from .iterator import MergingIterator
 from .memtable import DEFAULT_CAPACITY_BYTES, MemTable
-from .record import HEADER_SIZE, Record, RecordType, encode_record, iter_records
+from .record import (
+    HEADER_SIZE,
+    PAYLOAD_OVERHEAD,
+    Record,
+    RecordType,
+    decode_payload,
+    encode_payload,
+    encode_record,
+    frame,
+    iter_payload,
+    iter_records,
+    payload_size,
+    unframe,
+)
+from .sstable import (
+    DEFAULT_BLOCK_SIZE,
+    FOOTER_SIZE,
+    SSTableMeta,
+    SSTableReader,
+    SSTableWriter,
+    parse_file_id,
+    read_all,
+    sstable_filename,
+)
 from .wal import ReplayResult, WAL, read_records
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     # 主入口
     "LSMEngine",
     "EngineStats",
     "to_bytes",
-    # 组件
+    "WAL_FILENAME",
+    # 内存侧
     "MemTable",
+    "DEFAULT_CAPACITY_BYTES",
+    # 磁盘侧
+    "SSTableWriter",
+    "SSTableReader",
+    "SSTableMeta",
+    "sstable_filename",
+    "parse_file_id",
+    "read_all",
+    "DEFAULT_BLOCK_SIZE",
+    "FOOTER_SIZE",
+    # 日志
     "WAL",
     "ReplayResult",
     "read_records",
+    # 归并
+    "MergingIterator",
     # 记录层
     "Record",
     "RecordType",
     "encode_record",
+    "encode_payload",
+    "decode_payload",
     "iter_records",
+    "iter_payload",
+    "frame",
+    "unframe",
+    "payload_size",
     "HEADER_SIZE",
+    "PAYLOAD_OVERHEAD",
     # 异常
     "LSMError",
     "CorruptionError",
@@ -56,6 +106,4 @@ __all__ = [
     "ChecksumMismatchError",
     "ClosedError",
     "InvalidArgumentError",
-    # 常量
-    "DEFAULT_CAPACITY_BYTES",
 ]

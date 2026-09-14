@@ -197,6 +197,20 @@ class WAL:
                 os.fsync(fh.fileno())
             self._size = size
 
+    def truncate(self) -> None:
+        """清空日志,从头开始写。
+
+        ⚠️ **只在数据已经落到别处之后调用** —— 比如内存表刚刷成 SSTable。
+        日志是唯一的恢复来源,先清日志再落盘就等于丢数据。
+
+        截断后写句柄是关闭状态,下次 ``append`` 会按需重开。
+        """
+        self._ensure_open()
+        if not self.path.exists():
+            self._size = 0
+            return
+        self._truncate(0)
+
     # ------------------------------------------------------------ 生命周期
 
     def close(self) -> None:
