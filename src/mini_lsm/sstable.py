@@ -235,6 +235,21 @@ class SSTableWriter:
         self._buf.clear()
         self._buf_first_key = None
 
+    # ------------------------------------------------------------ 状态
+
+    @property
+    def bytes_written(self) -> int:
+        """当前已经写出的字节数,含还在缓冲区、尚未落成块的部分。
+
+        compaction 用它判断"这个文件够大了,可以收尾换下一个"。
+        """
+        return self._bytes + len(self._buf)
+
+    @property
+    def entry_count(self) -> int:
+        """已经 add 进来的条目数。"""
+        return self._count
+
     def finish(self) -> SSTableMeta:
         """收尾:写出索引块和 footer,fsync 后关闭。返回元信息。"""
         if self._finished:

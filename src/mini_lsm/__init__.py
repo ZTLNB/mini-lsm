@@ -3,6 +3,7 @@
 已完成:
     阶段 1  WAL 预写日志 + MemTable 内存表 + 崩溃恢复
     阶段 2  SSTable 刷盘 + 多来源读路径(数据量不再受内存限制)
+    阶段 3  Manifest + 分层 Compaction(控制读放大,清理墓碑)
 
 快速开始::
 
@@ -19,10 +20,18 @@
         for key, value in db.scan(b"a", b"z"):
             print(key, value)
 
-数据目录里会有 ``wal.log`` 和若干 ``sst-*.sst``。
-内存表写满后自动刷成 SSTable,所以数据量可以远超内存。
+数据目录里会有 ``wal.log``、``MANIFEST.json`` 和若干 ``sst-*.sst``。
+内存表写满后自动刷成 SSTable,文件攒多了自动 compaction,
+所以数据量可以远超内存,查询也不会随文件数线性变慢。
 """
 
+from .compaction import (
+    CompactionTask,
+    level_budget,
+    overlapping_files,
+    pick_task,
+    plan_full_compaction,
+)
 from .engine import WAL_FILENAME, EngineStats, LSMEngine, to_bytes
 from .errors import (
     ChecksumMismatchError,
@@ -33,6 +42,7 @@ from .errors import (
     TruncatedRecordError,
 )
 from .iterator import MergingIterator
+from .manifest import MANIFEST_FILENAME, FileMeta, Manifest
 from .memtable import DEFAULT_CAPACITY_BYTES, MemTable
 from .record import (
     HEADER_SIZE,
@@ -60,7 +70,7 @@ from .sstable import (
 )
 from .wal import ReplayResult, WAL, read_records
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     # 主入口
@@ -80,6 +90,16 @@ __all__ = [
     "read_all",
     "DEFAULT_BLOCK_SIZE",
     "FOOTER_SIZE",
+    # 版本清单
+    "Manifest",
+    "FileMeta",
+    "MANIFEST_FILENAME",
+    # Compaction
+    "CompactionTask",
+    "pick_task",
+    "plan_full_compaction",
+    "overlapping_files",
+    "level_budget",
     # 日志
     "WAL",
     "ReplayResult",

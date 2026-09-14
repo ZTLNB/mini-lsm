@@ -194,13 +194,39 @@ class TestReadFromSSTable(EngineSSTableTestCase):
             self.assertEqual(db.stats().recovered_records, 1)
 
     def test_read_across_multiple_sstables(self):
-        with self.open_engine() as db:
+        """关掉自动归并,专门验证"文件多了以后读路径还对"。
+
+        阶段 3 之后 auto_compact 默认开启,5 次刷盘会被自动归并掉。
+        这里关心的不是归并,而是多来源读路径本身,所以显式关掉它。
+        """
+        with self.open_engine(auto_compact=False) as db:
             for batch in range(5):
                 for i in range(10):
                     db.put(f"b{batch}-k{i:02d}", f"v{batch}-{i}")
                 db.flush()
 
             self.assertEqual(db.stats().sstable_count, 5)
+            for batch in range(5):
+                for i in range(10):
+                    key = f"b{batch}-k{i:02d}"
+                    self.assertEqual(db.get_str(key), f"v{batch}-{i}", key)
+
+    def test_auto_compaction_keeps_file_count_bounded(self):
+        """同样的写入,开着自动归并,文件数就不会随刷盘次数线性增长。
+
+        这正是阶段 3 存在的理由:阶段 2 结束时 3000 条数据刷出 49 个文件,
+        一次 get 最多要翻 49 个文件。
+        """
+        with self.open_engine() as db:
+            for batch in range(5):
+                for i in range(10):
+                    db.put(f"b{batch}-k{i:02d}", f"v{batch}-{i}")
+                db.flush()
+
+            stats = db.stats()
+            self.assertLess(stats.sstable_count, 5, "自动归并应当把文件数压下来")
+            self.assertGreaterEqual(stats.compactions, 1)
+            # 压过之后,数据一条都不能少
             for batch in range(5):
                 for i in range(10):
                     key = f"b{batch}-k{i:02d}"
