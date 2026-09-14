@@ -4,6 +4,7 @@
 
     内存表写满 → 刷成 SSTable → 文件攒多了自动归并 → 重启时只重放没刷盘的一段
     → 不存在的键被过滤器挡在门外 → 热点数据不再重复读盘
+    → 扫描流式进行、读的时候有一致视图
 
 归并(compaction)那一段是阶段 3 的重点,它要回答两个问题:
     1. 文件只增不减怎么办 —— 3000 条数据刷出几十个文件,查一次要翻几十个
@@ -14,6 +15,12 @@
        布隆过滤器用每个 key 约 1 字节的代价把这一步省掉
     4. 反复查热点数据时,同一个块会被反复读盘、反复解析 ——
        块缓存把解析好的结果留在内存里
+
+阶段 5 补上读路径最后两块:
+    5. ``scan()`` 不再把结果物化成列表 —— 内存占用只和块大小有关,
+       而且迭代期间不持锁,不会把写卡住
+    6. 读的时候有一致视图 —— 快照创建之后的写入/删除/刷盘/归并
+       对它一律不可见。代价是文件被 pin 住,必须记得关。
 
 用法::
 
@@ -362,9 +369,114 @@ def demo() -> None:
         print(f"  刷盘后 WAL 里剩 {result.record_count} 条,"
               f" 损坏标记 = {result.truncated}")
 
+        # ---------------------------------------------------------- 9
+        section(14, "流式扫描:内存不随结果集增长")
+        scan_dir = root / "scan"
+        with LSMEngine(scan_dir, memtable_capacity=capacity) as db:
+            for i in range(3000):
+                db.put(f"key{i:05d}", "x" * 64)
+            db.flush()
+
+            cursor = db.scan()
+            print(f"  scan() 返回 {type(cursor).__name__} —— 惰性迭代器。")
+            print(f"    调用它的时候视图已经定格,但**一块数据都还没读**:")
+            print(f"      活快照 {db.snapshot_count} 个,"
+                  f" pin 住 {len(cursor.snapshot.file_ids)} 个文件")
+            first_key, _ = next(cursor)
+            print(f"    取第一条 {first_key.decode()} —— 只读了 1 个块")
+            cursor.close()
+            print(f"    close() 之后:活快照 {db.snapshot_count} 个")
+
+            print(f"\n  只取前 3 条就停:")
+            cursor = db.scan()
+            first_three: list[str] = []
+            for key, _value in cursor:
+                first_three.append(key.decode())
+                if len(first_three) == 3:
+                    break                   # 提前收工
+            cursor.close()                  # 迭代器持有快照,用完要放
+            print(f"    {first_three}")
+            print("    → 后面的块一个都没读。阶段 4 得先把整趟物化成 list 才行。")
+
+            print(f"\n  一调用就定格 —— 之后再写,它看不到:")
+            cursor = db.scan("key00000", "key00005")
+            db.put("key00001", "改过了")
+            old = dict(cursor)[b"key00001"]
+            new = db.get("key00001")
+            print(f"    迭代器里 key00001 = {old[:8]!r}...({len(old)} 字节)  ← 旧值")
+            print(f"    实时读   key00001 = {new!r}")
+
+            print(f"\n  迭代期间不持锁 —— 写入不会被卡住:")
+            cursor = db.scan()
+            next(cursor)
+            db.put("written-during-scan", "yes")
+            print(f"    扫描进行中写入成功;现在库里共 {len(list(db.keys()))} 个键")
+            cursor.close()
+
+        section(15, "快照读:一致视图")
+        snap_dir = root / "snapshot"
+        with LSMEngine(snap_dir, memtable_capacity=capacity) as db:
+            for i in range(500):
+                db.put(f"key{i:05d}", "v0")
+            db.flush()
+
+            with db.snapshot() as snap:
+                print(f"  快照 #{snap.snapshot_id} 创建:"
+                      f" 内存表副本 {snap.memtable_entries} 条,"
+                      f" 层结构里 {snap.sstable_count} 个文件")
+
+                # 快照之后把整个库搅一遍
+                for i in range(500):
+                    db.put(f"key{i:05d}", "v1")
+                for i in range(0, 500, 2):
+                    db.delete(f"key{i:05d}")
+                db.flush()
+                db.compact_all()
+                print("  之后: 500 条全改成 v1、删掉其中 250 条,再刷盘 + 全量归并")
+
+                snap_data = dict(snap.scan())
+                live_data = dict(db.scan())
+                print(f"    快照看到 {len(snap_data):>3} 条,"
+                      f" key00000 = {snap_data[b'key00000']!r}")
+                print(f"    实时看到 {len(live_data):>3} 条,"
+                      f" key00000 = {live_data.get(b'key00000')}")
+                print("    → 快照完全不受影响:它有自己的内存表副本、自己的层结构,")
+                print("      还有一批 pin 住的文件。这三样合起来就是'一致视图'。")
+
+            print(f"  退出 with 之后:活快照 {db.snapshot_count} 个")
+
+        section(16, "快照的代价:文件被 pin 住,磁盘回收不了")
+        pin_dir = root / "pin"
+        with LSMEngine(
+            pin_dir, memtable_capacity=capacity, auto_compact=False
+        ) as db:
+            for i in range(3000):
+                db.put(f"key{i:05d}", "x" * 64)
+            db.flush()
+            before = sum(p.stat().st_size for p in pin_dir.glob("*.sst"))
+            print(f"  归并前: {db.stats().sstable_count} 个文件,{human(before)}")
+
+            snap = db.snapshot()
+            pinned = len(snap.file_ids)
+            db.compact_all()
+            held = sum(p.stat().st_size for p in pin_dir.glob("*.sst"))
+            print(f"  开着快照做全量归并:")
+            print(f"    pin 住 {pinned} 个文件,待删清单 {len(db.pending_delete_files)} 个")
+            print(f"    磁盘占用 {human(held)}  ← 新旧两套同时存在")
+            print(f"    快照仍然读得到: key00000 = {snap.get_str('key00000')[:12]}...")
+
+            snap.close()
+            after = sum(p.stat().st_size for p in pin_dir.glob("*.sst"))
+            print(f"  关掉快照之后:")
+            print(f"    待删清单 {len(db.pending_delete_files)} 个,"
+                  f" 磁盘占用 {human(after)}  ← 立刻回收")
+            print("  → 所以快照一定要关。它不是内存泄漏,是**磁盘**泄漏。")
+            print("    用 with 语句是最省心的方式。")
+
         rule("数据不丢;半截记录被丢弃;归并让文件数不随写入量线性增长;"
              "墓碑在压到最底层后被真正清掉;"
-             "布隆过滤器挡掉不存在的键;块缓存让热点数据不再重复读盘")
+             "布隆过滤器挡掉不存在的键;块缓存让热点数据不再重复读盘;"
+             "扫描流式进行且不阻塞写入;快照给读一个一致视图")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

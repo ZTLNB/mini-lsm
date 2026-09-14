@@ -662,14 +662,41 @@ class SSTableReader:
                 break       # 块内也是升序,后面不可能再有
         return (False, None)
 
-    def iter_entries(self, fill_cache: bool = False) -> Iterator[tuple[bytes, bytes | None]]:
+    def iter_entries(
+        self,
+        start: bytes | None = None,
+        end: bytes | None = None,
+        fill_cache: bool = False,
+    ) -> Iterator[tuple[bytes, bytes | None]]:
         """按 key 升序产出 ``(key, value)``;墓碑的 value 为 ``None``。
+
+        区间是**左闭右开**的 ``[start, end)``,两端都可以省略。
+
+        ``start`` 不是"从头开始读然后跳过" —— 而是先用稀疏索引二分定位到
+        起始块,**前面的块一个都不读**。这是范围扫描最实在的一处优化:
+        查一个很窄的区间时,不该为此把整个文件读一遍。
 
         ``fill_cache`` 默认是 ``False``:这个接口的主要用途是 compaction
         和全量扫描,每个块只读一次。让它填缓存只会把热点数据挤出去。
         """
-        for index in range(len(self._index)):
+        if self._count == 0:
+            return
+
+        if start is None:
+            first_block = 0
+        else:
+            first_block = self._find_block(start)
+            if first_block < 0:
+                # start 比第一块的起始 key 还小 —— 那就从第一块开始,
+                # 块内的比较会跳过那些仍然小于 start 的 key
+                first_block = 0
+
+        for index in range(first_block, len(self._index)):
             for rec_type, key, value in self._read_block_at(index, fill_cache):
+                if start is not None and key < start:
+                    continue
+                if end is not None and key >= end:
+                    return          # 块内有序,后面的只会更大
                 yield key, (None if rec_type is RecordType.DELETE else value)
 
     # ------------------------------------------------------------ 元信息

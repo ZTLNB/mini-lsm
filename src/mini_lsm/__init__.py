@@ -5,6 +5,7 @@
     阶段 2  SSTable 刷盘 + 多来源读路径(数据量不再受内存限制)
     阶段 3  Manifest + 分层 Compaction(控制读放大,清理墓碑)
     阶段 4  Bloom Filter + Block Cache(消掉无谓的磁盘读)
+    阶段 5  快照读 + 流式范围扫描(一致视图,内存不随结果集增长)
 
 快速开始::
 
@@ -20,6 +21,11 @@
 
         for key, value in db.scan(b"a", b"z"):
             print(key, value)
+
+        # 一致视图:创建之后的写入对它不可见
+        with db.snapshot() as snap:
+            db.put("name", "bob")      # 快照看不到这次写入
+            print(snap.get_str("name"))  # alice
 
 数据目录里会有 ``wal.log``、``MANIFEST.json`` 和若干 ``sst-*.sst``。
 内存表写满后自动刷成 SSTable,文件攒多了自动 compaction,
@@ -50,7 +56,7 @@ from .errors import (
     TruncatedRecordError,
 )
 from .iterator import MergingIterator
-from .manifest import MANIFEST_FILENAME, FileMeta, Manifest
+from .manifest import MANIFEST_FILENAME, FileMeta, Manifest, find_file_in_level
 from .memtable import DEFAULT_CAPACITY_BYTES, MemTable
 from .record import (
     HEADER_SIZE,
@@ -66,6 +72,7 @@ from .record import (
     payload_size,
     unframe,
 )
+from .snapshot import ScanCursor, Snapshot, search_levels
 from .sstable import (
     DEFAULT_BLOCK_SIZE,
     FOOTER_MAGIC,
@@ -82,8 +89,7 @@ from .sstable import (
     sstable_filename,
 )
 from .wal import ReplayResult, WAL, read_records
-
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     # 主入口
@@ -121,6 +127,11 @@ __all__ = [
     "Manifest",
     "FileMeta",
     "MANIFEST_FILENAME",
+    "find_file_in_level",
+    # 快照与流式扫描
+    "Snapshot",
+    "ScanCursor",
+    "search_levels",
     # Compaction
     "CompactionTask",
     "pick_task",

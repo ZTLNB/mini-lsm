@@ -28,7 +28,13 @@ from pathlib import Path
 
 from .errors import CorruptionError
 
-__all__ = ["MANIFEST_FILENAME", "FileMeta", "Manifest"]
+__all__ = [
+    "MANIFEST_FILENAME",
+    "FileMeta",
+    "Manifest",
+    "find_file_in_level",
+    "files_overlapping",
+]
 
 #: manifest 文件名(故意不带 .sst 后缀,免得被当成数据文件扫到)
 MANIFEST_FILENAME = "MANIFEST.json"
@@ -101,6 +107,51 @@ class FileMeta:
         )
 
 
+def find_file_in_level(files: list[FileMeta], key: bytes) -> FileMeta | None:
+    """在**非重叠**层里二分找出唯一可能包含 ``key`` 的文件。
+
+    ⚠️ 为什么把它抽成模块级函数,而不是只留在 ``Manifest`` 上:
+
+        阶段 5 的快照要在**自己捕获的那一份层结构**上做同样的查找 ——
+        因为查找期间真实的 manifest 可能已经被 compaction 改掉了。
+        如果快照另写一份二分,两份实现迟早会分叉,而分叉的表现是
+        "偶发查不到数据",极难定位。共用一份就不存在这个问题。
+
+    前提(调用方必须保证):``files`` 按 ``smallest`` **升序**且互不重叠。
+    L0 不满足这个前提,不能用它。
+    """
+    if not files or key < files[0].smallest:
+        return None
+
+    lo, hi = 0, len(files) - 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if files[mid].smallest <= key:
+            lo = mid
+        else:
+            hi = mid - 1
+
+    candidate = files[lo]
+    return candidate if key <= candidate.largest else None
+
+
+def files_overlapping(
+    files: list[FileMeta], start: bytes, end: bytes
+) -> list[FileMeta]:
+    """挑出与 ``[start, end)`` 有交集的文件。
+
+    范围扫描用它剪枝:一个文件的最大键还不到 ``start``、或者最小键已经
+    到了 ``end``,它就整个不在区间里 —— 连打开都不必。
+
+    注意区间是**左闭右开**的,所以判断用的是 ``largest < start`` 和
+    ``smallest >= end``:恰好等于 ``end`` 的文件要排除掉。
+    """
+    return [
+        meta for meta in files
+        if meta.largest >= start and meta.smallest < end
+    ]
+
+
 class Manifest:
     """当前有效的 SSTable 集合。
 
@@ -146,20 +197,7 @@ class Manifest:
 
         L0 用不了这个 —— 它内部允许重叠,只能挨个查。
         """
-        files = self.levels[level]
-        if not files or key < files[0].smallest:
-            return None
-
-        lo, hi = 0, len(files) - 1
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if files[mid].smallest <= key:
-                lo = mid
-            else:
-                hi = mid - 1
-
-        candidate = files[lo]
-        return candidate if key <= candidate.largest else None
+        return find_file_in_level(self.levels[level], key)
 
     # ------------------------------------------------------------ 增删
 

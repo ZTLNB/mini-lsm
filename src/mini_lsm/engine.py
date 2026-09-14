@@ -1,14 +1,20 @@
 """存储引擎主入口 —— 把 WAL、MemTable、SSTable、Compaction 串成可用的 KV 存储。
 
-阶段 3 的能力边界:
-    文件不再只增不减了 —— L0 攒够就归并到 L1,超预算再往 L2 压,
-    压到最底层时墓碑被真正清掉。查询也从"挨个翻 L0"变成
-    "L0 挨个试 + L1 以上二分定位"。
+阶段 5 的能力边界:
+    读路径补上了最后两块:**一致视图**和**流式扫描**。
 
-    还差两样:
-      - **没有 Bloom Filter**:查一个不存在的 key,每一层还是要真的去读一次
-        文件才能确定"不在里面"(阶段 4 解决)
-      - **没有 MVCC**:读写用一把大锁串行化,也没有快照隔离(阶段 5 解决)
+    - ``snapshot()`` 拿到某一时刻的只读视图,之后的所有写入对它不可见,
+      且**跨多次 get/scan 都成立**(不是"每次查都看一眼当前状态")。
+    - ``scan()`` 不再把结果物化成列表 —— 它返回一个惰性迭代器,
+      内存占用只和"块大小 × 来源个数"有关,和结果集大小无关。
+      而且迭代过程中**不持有引擎锁**,所以边扫边写不会被卡住。
+
+    实现细节见 ``snapshot.py``。核心是:SSTable 不可变 + manifest 每次
+    替换就是一个新版本,于是"某一刻的一致状态"可以精确表示成
+    "内存表副本 + 层结构副本 + 一批被 pin 住的文件"。
+
+    仍然没有的东西:没有 per-key 版本链(所以不支持"读历史某个时间点"),
+    没有并发写(写仍然靠一把大锁串行化),没有事务。
 
 写路径(必须严格保持这个顺序):
     1. 先把变更追加到 WAL        ← 落盘,这是持久性的来源
@@ -25,10 +31,17 @@
     墓碑会**终止**查找 —— 它表示"这个键在此刻被删了",
     所以不需要、也不能再去更旧的文件里找。
 
+    这条路径由 ``snapshot.search_levels`` 实现,实时读和快照读**共用同一份**。
+    两边各写一份的话,迟早有一边忘了检查布隆过滤器、或者忘了
+    "L0 要挨个试",而这类分叉的表现是"偶发查不到数据",极难定位。
+
 崩溃安全的总原则:
     **manifest 是唯一的"有效文件集合"**。任何改动都遵循
     "先把新数据落盘 → 再原子替换 manifest → 最后删旧数据"。
     崩在任何一步,重启后要么是旧的一套、要么是新的一套,不存在中间态。
+
+    快照给这条原则加了一个附加条件:**被快照 pin 住的文件不能删**,
+    只能推迟到最后一个引用它的快照关闭之后再删(见 ``_pending_delete``)。
 """
 
 from __future__ import annotations
@@ -63,6 +76,8 @@ from .sstable import (
     parse_file_id,
     sstable_filename,
 )
+from .snapshot import ScanCursor, Snapshot, search_levels
+from .util import to_bytes
 from .wal import ReplayResult, WAL
 
 #: 默认的 WAL 文件名
@@ -76,20 +91,6 @@ DEFAULT_TARGET_FILE_SIZE = 2 * 1024 * 1024
 
 #: maybe_compact 的轮数上界。策略正确时几轮就收敛,这个上界只是防死循环。
 DEFAULT_MAX_COMPACTION_ROUNDS = 16
-
-
-def to_bytes(value: object, name: str) -> bytes:
-    """把用户输入统一转成 bytes。
-
-    允许传 str(按 UTF-8 编码),这样交互式使用时不必到处写 b""。
-    """
-    if isinstance(value, str):
-        return value.encode("utf-8")
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return bytes(value)
-    raise InvalidArgumentError(
-        f"{name} 必须是 str 或 bytes,实际是 {type(value).__name__}"
-    )
 
 
 @dataclass
@@ -119,6 +120,16 @@ class EngineStats:
     """过滤器块损坏、已降级成"没有过滤器"的文件数。"""
     cache: CacheStats = field(default_factory=CacheStats)
 
+    snapshots: int = 0
+    """当前还活着的快照数(每个 ``scan()`` 迭代器算一个)。"""
+    pinned_files: int = 0
+    """被活快照 pin 住、因此**不能删**的文件数。"""
+    pending_delete_files: int = 0
+    """已经离开 manifest、但因为还被快照引用而推迟删除的文件数。
+
+    它长期不为 0 说明有快照忘了关 —— 那批磁盘空间一直回收不了。
+    """
+
     @property
     def memtable_usage_ratio(self) -> float:
         if self.memtable_capacity <= 0:
@@ -141,6 +152,12 @@ class EngineStats:
                if self.bloom_corrupt_files else ""),
             str(self.cache),
         ]
+        if self.snapshots or self.pending_delete_files:
+            lines.append(
+                f"快照:   {self.snapshots} 个活着,"
+                f" pin 住 {self.pinned_files} 个文件,"
+                f" 待删 {self.pending_delete_files} 个"
+            )
         if self.level_files:
             layout = "  ".join(
                 f"L{index}={files}个/{size}B"
@@ -234,6 +251,18 @@ class LSMEngine:
         self._bloom_rejections = 0
         self._readers: dict[int, SSTableReader] = {}
         self._next_file_id = 1
+
+        # 活着的快照:snapshot_id → Snapshot。
+        # 引擎**强引用**快照,快照**弱引用**引擎 —— 单向强引用,避免循环,
+        # 快照的释放时机完全由调用方(或 GC)决定,不会被引擎拖着不放。
+        self._snapshots: dict[int, Snapshot] = {}
+        self._next_snapshot_id = 1
+
+        # 已经离开 manifest、但还被某个快照引用的文件。
+        # file_id → (meta, reader)。reader **不能提前关** —— 快照还要用它读。
+        self._pending_delete: dict[
+            int, tuple[FileMeta, SSTableReader | None]
+        ] = {}
 
         # 所有 reader 共用同一份块缓存 —— 跨文件的读才有机会互相命中。
         # (每个文件各配一个缓存的话,缓存总量会随文件数线性膨胀)
@@ -683,35 +712,125 @@ class LSMEngine:
         顺序不能变:新文件此刻**已经** fsync 过了(在 ``_merge_and_write``
         里做的),所以 manifest 可以先指向它们;而删旧文件必须放在
         manifest 落盘**之后**。
+
+        快照带来一个额外的岔路:如果某个旧文件还被活着的快照引用,
+        就**既不能关 reader 也不能删文件**,只能登记进 ``_pending_delete``,
+        等最后一个引用它的快照关掉再清理。
         """
         self._manifest.replace(removed, added)
         self._save_manifest()
 
+        pinned = self._pinned_file_ids()
+
         for meta in removed:
             reader = self._readers.pop(meta.file_id, None)
+            if meta.file_id in pinned:
+                # 快照还要读它。reader 留着(快照自己持有一份引用),
+                # 缓存里的块也留着 —— 快照扫描时正好还能命中。
+                self._pending_delete[meta.file_id] = (meta, reader)
+                continue
+
             if reader is not None:
                 reader.close()
             # 顺手把它在缓存里的块清掉。不清也不会读到脏数据(file_id
             # 不复用),但这些块再也不会被访问,留着纯粹是占内存。
             self._block_cache.evict_file(meta.file_id)
+            # manifest 已经不再引用它了,现在删才安全
+            (self.data_dir / sstable_filename(meta.file_id)).unlink(
+                missing_ok=True
+            )
+
         for meta in added:
             path = self.data_dir / sstable_filename(meta.file_id)
             self._readers[meta.file_id] = SSTableReader(
                 path, meta.file_id, cache=self._block_cache
             )
 
-        # manifest 已经不再引用这些文件了,现在删才安全
-        for meta in removed:
-            (self.data_dir / sstable_filename(meta.file_id)).unlink(missing_ok=True)
+    # ------------------------------------------------------------ 快照
+
+    def snapshot(self) -> Snapshot:
+        """创建一份一致只读视图。
+
+        返回的 ``Snapshot`` 会**pin 住它用到的所有文件** —— 之后即使
+        compaction 想删它们,也只能推迟。所以**一定要关掉**::
+
+            with db.snapshot() as snap:
+                print(snap.get("k"))
+
+        要扫描区间直接用 ``db.scan()``(它内部就是这么做的),
+        不需要自己开快照。
+        """
+        with self._lock:
+            self._ensure_open()
+
+            snap = Snapshot(
+                engine=self,
+                snapshot_id=self._next_snapshot_id,
+                # 内存表此刻的有序副本。list(...) 之后就是独立的一份了,
+                # 之后的 put/delete 改的是原 dict,碰不到它。
+                mem_items=list(self._memtable.items()),
+                # 传 manifest.levels 本身 —— Snapshot 内部会逐层复制。
+                levels=self._manifest.levels,
+                readers=self._readers,
+            )
+            self._snapshots[snap.snapshot_id] = snap
+            self._next_snapshot_id += 1
+            return snap
+
+    def _pinned_file_ids(self) -> set[int]:
+        """所有活快照引用到的文件 id 的并集。
+
+        只在 compaction 和快照释放时算 —— 这两处都不是热路径,
+        所以直接遍历所有快照就够了,不必额外维护引用计数。
+        """
+        pinned: set[int] = set()
+        for snap in self._snapshots.values():
+            pinned |= snap.file_ids
+        return pinned
+
+    def _release_snapshot(self, snap: Snapshot) -> None:
+        """快照关闭时回调:解除 pin,顺手回收已经没人引用的待删文件。
+
+        注意这里**不碰** ``self._readers`` —— 待删文件的 reader 早就被
+        从里面摘掉了,它现在只活在 ``_pending_delete`` 和快照手里。
+        """
+        with self._lock:
+            self._snapshots.pop(snap.snapshot_id, None)
+            if not self._pending_delete:
+                return
+            still_pinned = self._pinned_file_ids()
+            for file_id in list(self._pending_delete):
+                if file_id in still_pinned:
+                    continue        # 还有别的快照在看它,继续等
+                _meta, reader = self._pending_delete.pop(file_id)
+                if reader is not None:
+                    reader.close()
+                self._block_cache.evict_file(file_id)
+                (self.data_dir / sstable_filename(file_id)).unlink(
+                    missing_ok=True
+                )
+
+    def _drain_pending_delete(self) -> None:
+        """把所有待删文件真的删掉。**只在引擎关闭时调用**。
+
+        引擎要关了,快照也一并失效,所以这里不需要再管 pin。
+        """
+        for file_id, (_meta, reader) in self._pending_delete.items():
+            if reader is not None:
+                reader.close()
+            (self.data_dir / sstable_filename(file_id)).unlink(missing_ok=True)
+        self._pending_delete.clear()
 
     # ------------------------------------------------------------ 读取
 
-    def get(self, key: object) -> bytes | None:
-        """查询键。返回 ``None`` 表示不存在或已被删除。
+    def get_entry(self, key: object) -> tuple[bool, bytes | None]:
+        """返回 ``(是否存在, 值)``,和 ``MemTable.get_entry`` 的口径一致。
 
-        每一层都先问布隆过滤器"这个文件里一定没有这个 key 吗":
-        答"一定没有"就跳过,**一次磁盘读都省了**。这是阶段 4 的主要收益 ——
-        查不存在的键不再需要把每层都真读一遍。
+        ``(True, None)`` 表示墓碑(写过又删了),``(False, None)`` 表示
+        从未出现过。``get()`` 把两者都折叠成 ``None``;需要区分时用这个。
+
+        真正"翻层"的逻辑在 ``snapshot.search_levels`` 里 ——
+        和快照读共用同一份,免得两边慢慢走岔。
         """
         kb = to_bytes(key, "key")
 
@@ -721,31 +840,23 @@ class LSMEngine:
             # 内存表最新,先查它
             found, value = self._memtable.get_entry(kb)
             if found:
-                return value        # 可能是 None(墓碑)
+                return (True, value)    # 可能是 None(墓碑)
 
-            # L0:键范围互相重叠,只能从新到旧挨个试
-            for meta in self._manifest.levels[0]:
-                reader = self._readers[meta.file_id]
-                if not reader.might_contain(kb):
-                    self._bloom_rejections += 1
-                    continue
-                found, value = reader.get(kb)
-                if found:
-                    return value    # 墓碑同样在这里终止查找
+            found, value, rejections = search_levels(
+                self._manifest.levels, self._readers, kb
+            )
+            self._bloom_rejections += rejections
+            return (found, value)
 
-            # L1 及以上:层内不重叠,二分就能定位到唯一可能包含它的文件
-            for level in range(1, self._num_levels):
-                meta = self._manifest.find_file(level, kb)
-                if meta is None:
-                    continue
-                reader = self._readers[meta.file_id]
-                if not reader.might_contain(kb):
-                    self._bloom_rejections += 1
-                    continue
-                found, value = reader.get(kb)
-                if found:
-                    return value
-            return None
+    def get(self, key: object) -> bytes | None:
+        """查询键。返回 ``None`` 表示不存在或已被删除。
+
+        每一层都先问布隆过滤器"这个文件里一定没有这个 key 吗":
+        答"一定没有"就跳过,**一次磁盘读都省了**。这是阶段 4 的主要收益 ——
+        查不存在的键不再需要把每层都真读一遍。
+        """
+        found, value = self.get_entry(key)
+        return value if found else None
 
     def get_str(self, key: object, encoding: str = "utf-8") -> str | None:
         """查询并解码成字符串,方便交互式使用。"""
@@ -760,44 +871,36 @@ class LSMEngine:
         self,
         start: object | None = None,
         end: object | None = None,
-    ) -> Iterator[tuple[bytes, bytes]]:
-        """按 key 升序扫描区间 ``[start, end)``。
+    ) -> ScanCursor:
+        """按 key 升序**流式**扫描区间 ``[start, end)``。
 
         两端都可以省略:省略 start 表示从头开始,省略 end 表示扫到末尾。
         墓碑会被自动跳过。
 
-        实现是把内存表和所有层的所有文件一起交给归并迭代器 ——
-        对上层来说,"多个来源"和"一个有序表"没有区别。
-        阶段 5 会把它换成惰性流式版本;现在的结果会先物化成列表,
-        所以扫描一个很大的库会占不少内存。
+        和阶段 4 的三个区别,都是这个返回值带来的:
+
+        1. **惰性**:读一个块才解析一个块。扫一个比内存还大的库也不会 OOM。
+        2. **不阻塞写**:迭代期间**不持有引擎锁**,靠 pin 住文件保证数据还在。
+        3. **一致**:一调用就定格。``it = db.scan(); db.put(...)`` 之后再迭代,
+           看到的仍然是调用那一刻的状态 —— 而不是"扫到哪算哪"的混合视图。
+
+        返回的迭代器持有快照,扫完自动释放;中途 ``break`` 掉则由对象回收兜底。
+        想更精确地控制生命周期,用 ``with db.snapshot()`` 自己管::
+
+            with db.snapshot() as snap:
+                for key, value in snap.scan("a", "z"):
+                    ...
         """
-        with self._lock:
-            self._ensure_open()
-            # 在锁内先把结果物化成列表,避免迭代过程中被写入干扰
-            lo = to_bytes(start, "start") if start is not None else b""
-            hi = to_bytes(end, "end") if end is not None else None
+        snap = self.snapshot()
+        return ScanCursor(snap, snap.scan(start, end))
 
-            sources: list[Iterator[tuple[bytes, bytes | None]]] = [
-                self._memtable.items()
-            ]
-            for meta in self._manifest.files():     # 已是"新到旧"
-                sources.append(self._readers[meta.file_id].iter_entries())
-
-            snapshot: list[tuple[bytes, bytes]] = []
-            for key, value in MergingIterator(sources):
-                if key < lo:
-                    continue
-                if hi is not None and key >= hi:
-                    break
-                if value is None:      # 墓碑,跳过
-                    continue
-                snapshot.append((key, value))
-
-        return iter(snapshot)
-
-    def keys(self) -> Iterator[bytes]:
-        """所有存活键,升序。"""
-        return (k for k, _ in self.scan())
+    def keys(
+        self,
+        start: object | None = None,
+        end: object | None = None,
+    ) -> Iterator[bytes]:
+        """区间内所有存活键,升序。"""
+        return (key for key, _ in self.scan(start, end))
 
     # ------------------------------------------------------------ 状态
 
@@ -830,6 +933,9 @@ class LSMEngine:
                     1 for reader in self._readers.values() if reader.bloom_corrupt
                 ),
                 cache=self._block_cache.stats(),
+                snapshots=len(self._snapshots),
+                pinned_files=len(self._pinned_file_ids()),
+                pending_delete_files=len(self._pending_delete),
             )
 
     @property
@@ -865,6 +971,27 @@ class LSMEngine:
         """写新文件时给布隆过滤器分配的 bits/key(0 表示不写过滤器)。"""
         return self._bloom_bits_per_key
 
+    @property
+    def snapshot_count(self) -> int:
+        """当前活着的快照数。每个未耗尽的 ``scan()`` 迭代器算一个。"""
+        with self._lock:
+            return len(self._snapshots)
+
+    @property
+    def pending_delete_files(self) -> list[int]:
+        """已经离开 manifest、但还在等快照释放的文件 id,升序。
+
+        它长期不空就说明有快照忘了关 —— 那批磁盘空间回收不了。
+        """
+        with self._lock:
+            return sorted(self._pending_delete)
+
+    @property
+    def pinned_file_ids(self) -> list[int]:
+        """当前被快照 pin 住的文件 id,升序。"""
+        with self._lock:
+            return sorted(self._pinned_file_ids())
+
     # ------------------------------------------------------------ 生命周期
 
     def sync(self) -> None:
@@ -881,14 +1008,27 @@ class LSMEngine:
 
         **不会**顺手把内存表刷成 SSTable —— 那样每次关闭都会留下一个
         很小的文件。内存表的数据由 WAL 保证,下次启动重放即可。
+
+        已经发出去的快照会一并失效(再读会抛 ``ClosedError``),
+        它们 pin 住的待删文件也在这里真正删掉 —— 引擎都关了,
+        没有"还在读"的可能了。
         """
         with self._lock:
             if self._closed:
                 return
+
+            # 先失效快照。注意用 _invalidate 而不是 close:后者会回调
+            # _release_snapshot,而这里正持着锁,重入容易出岔子。
+            for snap in list(self._snapshots.values()):
+                snap._invalidate()
+            self._snapshots.clear()
+
             self._wal.close()
             for reader in self._readers.values():
                 reader.close()
             self._readers.clear()
+
+            self._drain_pending_delete()
             self._closed = True
 
     def _ensure_open(self) -> None:

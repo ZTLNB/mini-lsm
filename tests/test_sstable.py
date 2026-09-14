@@ -909,6 +909,125 @@ class TestReaderBlockCache(SSTableTestCase):
             self.assertEqual(len(cache), 0)
 
 
+class TestRangedIteration(SSTableTestCase):
+    """``iter_entries(start, end)`` —— 阶段 5 流式范围扫描的地基。
+
+    关键不只是"结果对",还有"**没读不该读的块**"。
+    如果 start 只是"从头读然后跳过",那么窄区间扫描等于全表扫描,
+    阶段 5 的收益就全没了 —— 所以要用读块计数把它钉死。
+    """
+
+    def setUp(self):
+        super().setUp()
+        # 60 条,块大小 128 → 十几个块,足够区分"读一个块"和"读全部块"
+        self.entries = [(f"key{i:03d}".encode(), f"value{i}".encode())
+                        for i in range(60)]
+        self.write_table(self.entries, block_size=128)
+
+    def test_no_bounds_yields_everything(self):
+        with SSTableReader(self.path, file_id=1) as reader:
+            self.assertEqual(list(reader.iter_entries()), self.entries)
+
+    def test_start_only(self):
+        with SSTableReader(self.path, file_id=1) as reader:
+            got = list(reader.iter_entries(start=b"key050"))
+        self.assertEqual(got, self.entries[50:])
+
+    def test_end_only(self):
+        with SSTableReader(self.path, file_id=1) as reader:
+            got = list(reader.iter_entries(end=b"key010"))
+        self.assertEqual(got, self.entries[:10])
+
+    def test_both_bounds_are_half_open(self):
+        """区间是左闭右开:``start`` 含,``end`` 不含。"""
+        with SSTableReader(self.path, file_id=1) as reader:
+            got = [k for k, _ in reader.iter_entries(b"key010", b"key020")]
+        self.assertEqual(got, [f"key{i:03d}".encode() for i in range(10, 20)])
+
+    def test_end_equal_to_a_key_excludes_it(self):
+        with SSTableReader(self.path, file_id=1) as reader:
+            got = [k for k, _ in reader.iter_entries(end=b"key010")]
+        self.assertNotIn(b"key010", got)
+        self.assertIn(b"key009", got)
+
+    def test_range_beyond_last_key_is_empty(self):
+        with SSTableReader(self.path, file_id=1) as reader:
+            self.assertEqual(list(reader.iter_entries(start=b"zzz")), [])
+
+    def test_range_before_first_key_is_empty(self):
+        with SSTableReader(self.path, file_id=1) as reader:
+            self.assertEqual(list(reader.iter_entries(end=b"aaa")), [])
+
+    def test_empty_range_is_empty(self):
+        with SSTableReader(self.path, file_id=1) as reader:
+            self.assertEqual(
+                list(reader.iter_entries(b"key030", b"key030")), []
+            )
+
+    def test_start_before_first_key_behaves_like_no_start(self):
+        """start 比第一块的首键还小时,``_find_block`` 会返回 -1 ——
+        这时必须退回第 0 块,而不是直接产出空结果。"""
+        with SSTableReader(self.path, file_id=1) as reader:
+            got = list(reader.iter_entries(start=b"a"))
+        self.assertEqual(got, self.entries)
+
+    def test_start_skips_earlier_blocks(self):
+        """窄区间扫描**不该**把前面的块读一遍 —— 这是这个参数的全部意义。"""
+        with _CountingReader(self.path, file_id=1, cache=None) as reader:
+            total_blocks = len(reader._index)      # noqa: SLF001 - 测试需要
+            self.assertGreater(total_blocks, 3, "块数太少,测不出区别")
+
+            reader.block_reads = 0
+            got = list(reader.iter_entries(start=b"key050"))
+            self.assertEqual(got, self.entries[50:])
+            self.assertLess(
+                reader.block_reads, total_blocks,
+                "从 key050 开始扫却读了全部块,说明 start 没被用来定位",
+            )
+
+    def test_full_iteration_reads_every_block_exactly_once(self):
+        with _CountingReader(self.path, file_id=1, cache=None) as reader:
+            total_blocks = len(reader._index)      # noqa: SLF001
+            reader.block_reads = 0
+            self.assertEqual(list(reader.iter_entries()), self.entries)
+            self.assertEqual(reader.block_reads, total_blocks)
+
+    def test_fill_cache_defaults_to_false(self):
+        """全扫默认不填缓存 —— 否则会把热点块挤出去(缓存污染)。"""
+        cache = BlockCache(1 << 20)
+        with SSTableReader(self.path, file_id=1, cache=cache) as reader:
+            list(reader.iter_entries())
+            self.assertEqual(len(cache), 0, "全扫不该往缓存里塞东西")
+
+    def test_fill_cache_true_does_fill(self):
+        cache = BlockCache(1 << 20)
+        with SSTableReader(self.path, file_id=1, cache=cache) as reader:
+            list(reader.iter_entries(fill_cache=True))
+            self.assertGreater(len(cache), 0)
+
+    def test_tombstones_are_yielded_as_none(self):
+        entries = [(b"a", b"1"), (b"b", None), (b"c", b"3")]
+        path = self.dir / "sst-000002.sst"
+        self.write_table(entries, path=path)
+        with SSTableReader(path, file_id=2) as reader:
+            self.assertEqual(list(reader.iter_entries()), entries)
+            self.assertEqual(list(reader.iter_entries(b"b", b"c")), [(b"b", None)])
+
+    def test_tombstone_only_range(self):
+        entries = [(b"a", b"1"), (b"b", None), (b"c", b"3")]
+        path = self.dir / "sst-000003.sst"
+        self.write_table(entries, path=path)
+        with SSTableReader(path, file_id=3) as reader:
+            self.assertEqual(list(reader.iter_entries(b"b", b"c")), [(b"b", None)])
+
+    def test_empty_table_yields_nothing(self):
+        path = self.dir / "sst-000004.sst"
+        self.write_table([], path=path)
+        with SSTableReader(path, file_id=4) as reader:
+            self.assertEqual(list(reader.iter_entries()), [])
+            self.assertEqual(list(reader.iter_entries(b"a", b"z")), [])
+
+
 class TestHelpers(unittest.TestCase):
     def test_read_all(self):
         tmp = tempfile.TemporaryDirectory()
