@@ -315,7 +315,18 @@ class Snapshot:
     ) -> Iterator[tuple[bytes, bytes | None]]:
         """内存表副本在 ``[lo, hi)`` 内的那一段。
 
-        用 bisect 直接切出区间,不用从第一个键开始走。
+        用 bisect 直接在键列表上切出区间,不用从第一个键开始走。
+        这正是 ``_mem_keys`` / ``_mem_values`` 拆成两个列表的原因 ——
+        ``bisect`` 需要一个**独立的、有序的键序列**,拿 ``[(k, v), ...]``
+        去二分得自己写比较函数,而元组比较会在 key 相同时去比 value,
+        碰到 ``bytes`` 和 ``None`` 混在一起就抛 ``TypeError``。
+
+        ⚠️ 边界是这个方法最容易写错的地方(start 比第一个键还小、
+        end 落在两个键中间、start == end、反向区间)。
+        ``MemTable.range_items()`` 是同一件事的**朴素 O(n) 版本**,
+        正确性一眼可见 —— 它被留作预言机,由
+        ``tests/test_snapshot.py::TestMemtableSliceOracle`` 拿随机区间
+        和这里做比对。改这段之前先跑那个测试。
         """
         keys = self._mem_keys
         begin = bisect_left(keys, lo) if lo is not None else 0

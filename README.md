@@ -981,11 +981,11 @@ compaction 时 `inputs` 的顺序（`source_files + target_files`，都是新到
 
 ## 测试
 
-**661 个测试，全部通过。**
+**667 个测试，全部通过。**
 
 ```bash
 $ python -m unittest discover -s tests
-Ran 661 tests in 12.619s
+Ran 667 tests in 7.599s
 OK
 ```
 
@@ -1004,9 +1004,9 @@ OK
 | `test_manifest.py` | 层序契约、二分查找、原子落盘、格式校验 | 58 |
 | `test_compaction.py` | 策略层：触发条件、重叠筛选、丢墓碑时机、收敛性 | 42 |
 | `test_engine_compaction.py` | 端到端：数据完整性、墓碑安全、多级归并、磁盘状态 | 48 |
-| `test_snapshot.py` | **一致视图、文件 pin 与延迟删除、流式语义、快照读与实时读一致性、边扫边归并** | 83 |
+| `test_snapshot.py` | **一致视图、文件 pin 与延迟删除、流式语义、快照读与实时读一致性、边扫边归并、内存表切片的预言机比对** | 89 |
 | `test_fuzz.py` | 随机负载 vs 内存字典模型（固定种子） | 1 |
-| **合计** | | **661** |
+| **合计** | | **667** |
 
 ### 随机压力测试
 
@@ -1053,6 +1053,36 @@ seed=  3 OK  存活键=31  文件=1  刷盘=64  归并=37  分层=[0, 0, 1]  过
 1065 次 compaction 中有 282 次真的推迟了删除，累计 555 个文件被 pin 住
 ```
 
+### 预言机：拿"慢但显然正确"的实现校验"快但容易写错"的实现
+
+模糊测试解决的是"我没想到的情况"。还有一类问题它解决不了：
+**某个优化实现本身在边界上写错了，而错误恰好落在随机数据覆盖不到的地方。**
+
+阶段 5 的 `Snapshot._memtable_source()` 就是这种代码 —— 用 `bisect_left`
+在键列表上切区间，快，但四个边界（start 比第一个键还小、end 落在两个键之间、
+`start == end`、反向区间）每一个都可能差一位。
+
+所以 `MemTable.range_items()` 被**特意保留**下来：它先 `sorted()` 整张表
+再从第一个键走，O(n)，慢得没法用，但**正确性一眼可见**。
+它现在的工作是当**预言机（oracle）**：
+
+```python
+# tests/test_snapshot.py::TestMemtableSliceOracle
+got  = dict(snap.scan(lo, hi))                       # bisect 版本（被测）
+want = {k: v for k, v in model.range_items(lo, hi)   # 朴素版本（预言机）
+        if v is not None}
+self.assertEqual(got, want)
+```
+
+400 多个随机区间跑下来，只要 bisect 版本有一位偏差就会立刻暴露。
+
+**这个模式值得复用**：任何时候你把一段"显然正确但慢"的代码换成
+"快但需要动脑"的代码，别把旧的删掉 —— 留着当预言机。
+手写边界用例只能覆盖你想到的边界，预言机覆盖你想不到的。
+
+> 我验证过它不是白跑的：故意把 `bisect_left` 改成 `bisect_right`
+> 注入一位偏差，6 个用例里 5 个立刻失败。
+
 ### 几个刻意写得比较刁钻的用例
 
 - **`test_filter_bytes_identical_across_processes`** —— 用三个不同
@@ -1086,6 +1116,10 @@ seed=  3 OK  存活键=31  文件=1  刷盘=64  归并=37  分层=[0, 0, 1]  过
   之后 `put` / `delete` 都不该改变它。
 - **`test_start_skips_earlier_blocks`** —— `iter_entries(start=...)`
   必须用稀疏索引定位起始块，而不是"从头读再跳过"。
+- **`test_bisect_slice_matches_naive_scan_over_random_ranges`** ——
+  拿"显然正确但 O(n)"的 `MemTable.range_items()` 当**预言机**，
+  用 400 多个随机区间去校验 bisect 版本。手写边界用例只能覆盖我想到的边界，
+  随机比对能覆盖我没想到的。
 - **`test_detects_overlap_in_l1`** —— 层内重叠会让二分静默出错
 - **`test_files_dropped_into_fresh_directory_are_adopted`** —— 见下方"踩过的坑"
 - **`test_read_block_rejects_length_beyond_eof`** —— 见下方"踩过的坑"

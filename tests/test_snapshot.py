@@ -17,6 +17,7 @@
 
 import gc
 import os
+import random
 import sys
 import tempfile
 import unittest
@@ -31,6 +32,7 @@ from mini_lsm.manifest import (  # noqa: E402
     files_overlapping,
     find_file_in_level,
 )
+from mini_lsm.memtable import MemTable  # noqa: E402
 from mini_lsm.snapshot import ScanCursor, Snapshot, search_levels  # noqa: E402
 from mini_lsm.sstable import SSTableReader, sstable_filename  # noqa: E402
 
@@ -931,6 +933,117 @@ class TestFilesOverlapping(unittest.TestCase):
 
     def test_range_before_everything(self):
         self.assertEqual(files_overlapping(self.files, b"", b"a"), [])
+
+
+class TestMemtableSliceOracle(SnapshotTestCase):
+    """拿"显然正确"的朴素实现,去校验跑得更快的 bisect 实现。
+
+    两边的角色分工很清楚:
+
+    - ``MemTable.range_items()`` —— 先 ``sorted()`` 整张表再从第一个键走,
+      O(n),慢得没法用,但**正确性一眼可见**。它是预言机(oracle)。
+    - ``Snapshot._memtable_source()`` —— 用 ``bisect_left`` 在键列表上
+      直接切区间,O(log n + 区间长度)。这是真正的热路径,而它的边界
+      (空区间、start 比第一个键还小、end 落在两个键之间、start == end)
+      恰恰最容易写错。
+
+    用随机区间把两者对上,比手写一堆边界用例可靠得多 —— 手写用例
+    只能覆盖我想到的边界,随机比对能覆盖我没想到的。
+    """
+
+    def _engine_with_memtable_only(self, latest: dict, deleted: set):
+        """造一个数据全在内存表里的引擎(容量给足,不触发刷盘)。"""
+        db = self.open_engine(memtable_capacity=1 << 20)
+        for key in sorted(latest):
+            db.put(key, latest[key])
+        for key in deleted:
+            db.delete(key)
+        self.assertEqual(db.stats().sstable_count, 0,
+                         "测试前提不成立:数据刷到磁盘上去了")
+        return db
+
+    def test_bisect_slice_matches_naive_scan_over_random_ranges(self):
+        rng = random.Random(20260915)
+        latest: dict[bytes, bytes] = {}
+        for i in range(300):
+            latest[f"key{rng.randrange(200):04d}".encode()] = f"v{i}".encode()
+        keys = sorted(latest)
+        # 故意删掉一批,让区间里出现墓碑 —— 归并流必须看到它们、
+        # 但面向用户的 scan 必须把它们过滤掉
+        deleted = set(keys[::17])
+
+        db = self._engine_with_memtable_only(latest, deleted)
+        model = MemTable(1 << 20)
+        for key in keys:
+            model.put(key, latest[key])
+        for key in deleted:
+            model.delete(key)
+
+        # 探针里混进几个边界值:空前缀、第一键、末键、超出末尾的键
+        probes = sorted({b"", keys[0], keys[-1], b"zzz"} | set(keys[::11]))
+
+        checked = 0
+        with db.snapshot() as snap:
+            for lo in probes:
+                for hi in probes:
+                    got = dict(snap.scan(lo, hi))
+                    want = {
+                        k: v for k, v in model.range_items(lo, hi)
+                        if v is not None
+                    }
+                    self.assertEqual(
+                        got, want, f"区间 [{lo!r}, {hi!r}) 和朴素实现不一致"
+                    )
+                    checked += 1
+        self.assertGreater(checked, 100, "探针太少,没测到什么")
+
+    def test_empty_and_inverted_ranges(self):
+        db = self.open_engine(memtable_capacity=1 << 20)
+        for i in range(5):
+            db.put(f"k{i}", str(i))
+        with db.snapshot() as snap:
+            # 空区间:左闭右开,start == end 什么都没
+            self.assertEqual(list(snap.scan("k2", "k2")), [])
+            # 反向区间:begin > stop,range() 直接为空
+            self.assertEqual(list(snap.scan("k4", "k1")), [])
+
+    def test_start_before_first_key_and_end_after_last(self):
+        db = self.open_engine(memtable_capacity=1 << 20)
+        for i in range(5):
+            db.put(f"k{i}", str(i))
+        with db.snapshot() as snap:
+            self.assertEqual(len(list(snap.scan(b"", b"zzz"))), 5)
+            self.assertEqual([k for k, _ in snap.scan(b"a", b"zzz")],
+                             [b"k0", b"k1", b"k2", b"k3", b"k4"])
+            self.assertEqual(list(snap.scan(b"z", b"zzz")), [])
+
+    def test_end_landing_between_two_keys(self):
+        """end 落在两个键中间时,只该切到比它小的那一侧。"""
+        db = self.open_engine(memtable_capacity=1 << 20)
+        for key in (b"a", b"c", b"e"):
+            db.put(key, b"1")
+        with db.snapshot() as snap:
+            self.assertEqual([k for k, _ in snap.scan(b"a", b"d")], [b"a", b"c"])
+            self.assertEqual([k for k, _ in snap.scan(b"b", b"e")], [b"c"])
+
+    def test_single_key_range(self):
+        db = self.open_engine(memtable_capacity=1 << 20)
+        for key in (b"a", b"b", b"c"):
+            db.put(key, b"1")
+        with db.snapshot() as snap:
+            self.assertEqual([k for k, _ in snap.scan(b"b", b"c")], [b"b"])
+
+    def test_memtable_only_snapshot_has_no_file_sources(self):
+        """纯内存表的快照不该产生任何文件来源 —— 顺便确认剪枝没把内存表剪掉。"""
+        db = self.open_engine(memtable_capacity=1 << 20)
+        for i in range(5):
+            db.put(f"k{i}", str(i))
+        with db.snapshot() as snap:
+            self.assertEqual(snap.sstable_count, 0)
+            self.assertEqual(len(list(snap.scan())), 5)
+            # 区间很窄时也必须还能切到内存表那一段
+            self.assertEqual([k for k, _ in snap.scan("k1", "k3")],
+                             [b"k1", b"k2"])
 
 
 class TestEngineStatsSnapshots(SnapshotTestCase):

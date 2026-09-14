@@ -130,7 +130,23 @@ class MemTable:
     def range_items(self, start: bytes, end: bytes) -> Iterator[tuple[bytes, bytes | None]]:
         """产出 ``[start, end)`` 区间内的键值对,按升序。
 
-        阶段 5 的范围扫描会用到;现在先提供出来,顺便让有序性可见。
+        ⚠️ **这是"显然正确"的朴素版本,不是热路径。** 它先 ``sorted()`` 整个
+        键空间再从第一个键开始走,代价是 O(n) —— 扫一个很窄的区间也要
+        把整张表排一遍。
+
+        真正的范围扫描走 ``Snapshot._memtable_source()``:它用
+        ``bisect_left`` 直接在**键列表**上切出区间,代价是
+        O(log n + 区间长度)。所以阶段 5 并没有用上这个方法。
+
+        那为什么留着它?**当预言机(oracle)用。** 它的正确性一眼可见,
+        而 bisect 版本在边界上(空区间、start 比第一个键还小、
+        end 落在两个键之间、start == end)恰恰最容易写错。
+        ``tests/test_snapshot.py::TestMemtableSliceOracle`` 拿它对
+        bisect 版本做随机区间比对 —— 拿一个显然正确的实现去校验一个
+        跑得更快的实现,比自己手写一堆边界用例可靠得多。
+
+        ⚠️ 千万别把它接到扫描路径上。它不会报错,只会**静默地**
+        把每次窄区间扫描变成全表排序。
         """
         for key, value in self.items():
             if key < start:

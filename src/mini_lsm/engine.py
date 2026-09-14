@@ -451,8 +451,16 @@ class LSMEngine:
     def put_many(self, items: dict | list[tuple]) -> int:
         """批量写入,返回写入条数。
 
-        注意:这不是一个原子事务 —— 中途失败会留下部分写入。
-        真正的原子性要等阶段 5 的 MVCC。
+        ⚠️ **这不是一个原子事务** —— 它只是 `put` 的一个循环。
+        中途失败(比如某个 value 类型不对)会留下**部分写入**,
+        而且没有任何办法回滚。
+
+        别指望阶段 5 解决了这个:阶段 5 加的是**读**的一致视图
+        (快照),不是**写**的原子性。真正的批量原子写需要 WAL 里
+        带事务边界标记 + 提交记录,是另一件事 —— 这个项目没做。
+
+        另外它也不是为了"快":每次 `put` 都要单独过一遍锁和 WAL 追加。
+        真要做批量导入,直接循环调用 `put` 效果一样。
         """
         pairs = list(items.items()) if isinstance(items, dict) else list(items)
         for key, value in pairs:
