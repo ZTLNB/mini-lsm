@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mini-lsm"
-version = "0.3.0"
-description = "从零实现的 LSM-Tree 存储引擎:WAL + 内存表 + SSTable + Manifest + 分层归并 + 崩溃恢复(纯 Python,零依赖)"
+version = "0.4.0"
+description = "从零实现的 LSM-Tree 存储引擎:WAL + 内存表 + SSTable + Manifest + 分层归并 + 布隆过滤器 + 块缓存 + 崩溃恢复(纯 Python,零依赖)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "ZTLNB" }]
-keywords = ["lsm-tree", "storage-engine", "database", "wal", "write-ahead-log", "sstable", "compaction", "manifest", "key-value-store"]
+keywords = ["lsm-tree", "storage-engine", "database", "wal", "write-ahead-log", "sstable", "compaction", "manifest", "bloom-filter", "block-cache", "key-value-store"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

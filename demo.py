@@ -3,10 +3,17 @@
 跑一遍就能看到这条主线:
 
     内存表写满 → 刷成 SSTable → 文件攒多了自动归并 → 重启时只重放没刷盘的一段
+    → 不存在的键被过滤器挡在门外 → 热点数据不再重复读盘
 
 归并(compaction)那一段是阶段 3 的重点,它要回答两个问题:
     1. 文件只增不减怎么办 —— 3000 条数据刷出几十个文件,查一次要翻几十个
     2. 删掉的键怎么才能真正消失 —— 墓碑不能一直留着
+
+阶段 4 解决的是归并之后**剩下**的那部分开销:
+    3. 查一个不存在的键,还是要把每一层都真读一遍才知道"没有" ——
+       布隆过滤器用每个 key 约 1 字节的代价把这一步省掉
+    4. 反复查热点数据时,同一个块会被反复读盘、反复解析 ——
+       块缓存把解析好的结果留在内存里
 
 用法::
 
@@ -163,8 +170,84 @@ def demo() -> None:
             print("    这就是阶段 3 要解决的问题:L0 的文件键范围互相重叠,")
             print("    查一次的成本随文件数**线性增长**。")
 
+        # ---------------------------------------------------------- 4.5
+        section(7, "布隆过滤器:不存在的键不再白读文件")
+        bloom_dir = root / "bloom"
+        with LSMEngine(bloom_dir, memtable_capacity=capacity) as db:
+            for i in range(3000):
+                db.put(f"key{i:05d}", "x" * 64)
+            stats = db.stats()
+            print(f"  同一份负载: {stats.sstable_count} 个文件,"
+                  f"{human(stats.sstable_bytes)},分层 {layout(db)}")
+
+            total_filter = sum(reader.filter_size for reader in db.sstables)
+            share = total_filter / max(stats.sstable_bytes, 1)
+            print(f"  每个文件都带了一个布隆过滤器,合计 {total_filter} 字节"
+                  f" (占数据体积 {share:.1%})")
+
+            before = db.stats().bloom_rejections
+            probes = [f"nope{i:05d}" for i in range(200)]
+            for probe in probes:
+                db.get(probe)
+            rejected = db.stats().bloom_rejections - before
+            print(f"  查 {len(probes)} 个不存在的键:"
+                  f" 被过滤器挡下 {rejected} 次文件读"
+                  f" ({rejected / len(probes):.0%})")
+
+            before = db.stats().bloom_rejections
+            wrong = [i for i in range(200) if db.get(f"key{i:05d}") != b"x" * 64]
+            skipped = db.stats().bloom_rejections - before
+            print(f"  再查 {200} 个**存在**的键:查错 {len(wrong)} 个"
+                  f"  ← 必须为 0")
+            print(f"    期间过滤器还挡下 {skipped} 次 —— 这不是假阴性:")
+            print("    被挡下的是**那些不含这个键的文件**(键在别的层里),")
+            print("    挡对了才说明过滤器在干活。")
+
+            # 真正证明"没有假阴性"的办法:挨个文件翻出它实际有的键,
+            # 逐个问过滤器。只要有一个说"不在",就是丢数据。
+            false_negatives = 0
+            checked = 0
+            for reader in db.sstables:
+                for key, _value in reader.iter_entries():
+                    checked += 1
+                    if not reader.might_contain(key):
+                        false_negatives += 1
+            print(f"  逐文件核对 {checked} 条实际存在的记录:"
+                  f" 假阴性 {false_negatives} 个")
+            print("  假阳性(说在、其实不在)只是白读一次,慢一点;")
+            print("  假阴性(说不在、其实在)会**丢数据** —— 所以任何取舍都倒向'宁可说在'。")
+
+        section(8, "块缓存:热点数据不重复读盘")
+        with LSMEngine(
+            bloom_dir, memtable_capacity=capacity, block_cache_size=256 * 1024
+        ) as db:
+            db.block_cache.clear()
+            db.block_cache.reset_stats()
+
+            for i in range(200):
+                db.get(f"key{i:05d}")
+            cold = db.block_cache.stats()
+            for i in range(200):
+                db.get(f"key{i:05d}")
+            warm = db.block_cache.stats()
+
+            print(f"  冷读 200 次: 命中 {cold.hits} / {cold.lookups}"
+                  f" ({cold.hit_rate:.1%})")
+            print(f"  热读 200 次: 累计命中 {warm.hits} / {warm.lookups}"
+                  f" ({warm.hit_rate:.1%})  ← 同一个块不用再读第二遍")
+            print(f"  缓存占用: {human(warm.bytes)} / {human(warm.capacity_bytes)}"
+                  f" ({warm.entries} 块)")
+
+            db.block_cache.reset_stats()
+            list(db.scan())
+            after_scan = db.block_cache.stats()
+            print(f"  全量 scan() 之后: 命中 {after_scan.hits} 次,"
+                  f" 缓存里仍是 {len(db.block_cache)} 块")
+            print("    顺序全扫的块只会被读一次,塞进 LRU 会把真正的热点挤出去")
+            print("    —— 这叫缓存污染,所以 scan 默认不填缓存(fill_cache=False)。")
+
         # ---------------------------------------------------------- 5
-        section(7, "手动归并:把 L0 压到 L1")
+        section(9, "手动归并:把 L0 压到 L1")
         manual_dir = root / "manual"
         # 内存表容量给足,让每批 200 条正好一次刷盘 —— 这样"6 批 → 6 个文件"最直观
         # (内存表按 key + 64 字节开销 + value 计费,200 条大约 15 KiB)
@@ -190,7 +273,7 @@ def demo() -> None:
                   f"{db.get_str('b0-k000')} / {db.get_str('b5-k199')}")
 
         # ---------------------------------------------------------- 6
-        section(8, "墓碑的归宿:压到最底层才真正消失")
+        section(10, "墓碑的归宿:压到最底层才真正消失")
         tomb_dir = root / "tombstone"
         with LSMEngine(tomb_dir, auto_compact=False) as db:
             for key, value in (("a", "1"), ("b", "2"), ("c", "3")):
@@ -217,7 +300,7 @@ def demo() -> None:
             print(f"  重启后 b = {db.get('b')}  (依然是删除状态)")
 
         # ---------------------------------------------------------- 7
-        section(9, "Manifest:崩溃时'该信哪一套文件'")
+        section(11, "Manifest:崩溃时'该信哪一套文件'")
         manifest_dir = root / "manifest"
         with LSMEngine(manifest_dir, auto_compact=False) as db:
             for batch in range(3):
@@ -244,7 +327,7 @@ def demo() -> None:
                   f"{[db.get_str(f'k{i}') for i in range(3)]}")
 
         # ---------------------------------------------------------- 8
-        section(10, "崩溃恢复:WAL 尾部残缺")
+        section(12, "崩溃恢复:WAL 尾部残缺")
         crash_dir = root / "crash"
         crash_dir.mkdir(parents=True)
         crash_wal = crash_dir / "wal.log"
@@ -268,7 +351,7 @@ def demo() -> None:
                   f"{'(含截断)' if stats.recovery_truncated else ''}")
             print(f"  截断原因: {stats.recovery_reason}")
 
-        section(11, "恢复之后继续写入")
+        section(13, "恢复之后继续写入")
         with LSMEngine(crash_dir) as db:
             db.put("user:04", "dave")
             db.put("user:05", "erin")
@@ -280,7 +363,8 @@ def demo() -> None:
               f" 损坏标记 = {result.truncated}")
 
         rule("数据不丢;半截记录被丢弃;归并让文件数不随写入量线性增长;"
-             "墓碑在压到最底层后被真正清掉")
+             "墓碑在压到最底层后被真正清掉;"
+             "布隆过滤器挡掉不存在的键;块缓存让热点数据不再重复读盘")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

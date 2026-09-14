@@ -39,6 +39,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
+from .block_cache import DEFAULT_CACHE_BYTES, BlockCache, CacheStats
+from .bloom import DEFAULT_BITS_PER_KEY
 from .compaction import (
     DEFAULT_L0_TRIGGER,
     DEFAULT_LEVEL_BUDGET,
@@ -111,6 +113,12 @@ class EngineStats:
     level_files: list[int] = field(default_factory=list)
     level_bytes: list[int] = field(default_factory=list)
 
+    bloom_rejections: int = 0
+    """布隆过滤器挡下了多少次文件读 —— 也就是省掉了多少次磁盘 I/O。"""
+    bloom_corrupt_files: int = 0
+    """过滤器块损坏、已降级成"没有过滤器"的文件数。"""
+    cache: CacheStats = field(default_factory=CacheStats)
+
     @property
     def memtable_usage_ratio(self) -> float:
         if self.memtable_capacity <= 0:
@@ -128,6 +136,10 @@ class EngineStats:
             f"SSTable: {self.sstable_count} 个文件,"
             f" {self.sstable_entries} 条,{self.sstable_bytes} 字节",
             f"刷盘/归并: {self.flushes} 次 / {self.compactions} 次",
+            f"过滤器: 挡下 {self.bloom_rejections} 次文件读"
+            + (f"(有 {self.bloom_corrupt_files} 个过滤器损坏)"
+               if self.bloom_corrupt_files else ""),
+            str(self.cache),
         ]
         if self.level_files:
             layout = "  ".join(
@@ -170,6 +182,8 @@ class LSMEngine:
         level_size_factor: int = DEFAULT_LEVEL_FACTOR,
         target_file_size: int = DEFAULT_TARGET_FILE_SIZE,
         auto_compact: bool = True,
+        bloom_bits_per_key: int = DEFAULT_BITS_PER_KEY,
+        block_cache_size: int = DEFAULT_CACHE_BYTES,
     ) -> None:
         """
         参数:
@@ -185,11 +199,18 @@ class LSMEngine:
             level_size_factor:   层容量增长系数
             target_file_size:    compaction 产出文件的目标大小(字节)
             auto_compact:        是否在刷盘后自动触发 compaction
+            bloom_bits_per_key:  每个 key 分给布隆过滤器多少 bit。
+                                 10 对应约 1% 假阳性率;设 0 可以关掉过滤器。
+            block_cache_size:    块缓存容量(字节),0 表示关闭缓存
         """
         if num_levels < 2:
             raise InvalidArgumentError("num_levels 至少为 2")
         if l0_compaction_trigger < 1:
             raise InvalidArgumentError("l0_compaction_trigger 至少为 1")
+        if bloom_bits_per_key < 0:
+            raise InvalidArgumentError("bloom_bits_per_key 不能为负数")
+        if block_cache_size < 0:
+            raise InvalidArgumentError("block_cache_size 不能为负数")
 
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -206,11 +227,17 @@ class LSMEngine:
         self._level_budget = level_size_budget
         self._level_factor = level_size_factor
         self._target_file_size = target_file_size
+        self._bloom_bits_per_key = bloom_bits_per_key
 
         self._flush_count = 0
         self._compaction_count = 0
+        self._bloom_rejections = 0
         self._readers: dict[int, SSTableReader] = {}
         self._next_file_id = 1
+
+        # 所有 reader 共用同一份块缓存 —— 跨文件的读才有机会互相命中。
+        # (每个文件各配一个缓存的话,缓存总量会随文件数线性膨胀)
+        self._block_cache = BlockCache(block_cache_size)
 
         # 先把磁盘上已有的 SSTable 挂上来(它们是"更旧"的数据),
         # 再重放 WAL 重建内存表(更新的数据)。读路径按这个新旧顺序找。
@@ -258,7 +285,7 @@ class LSMEngine:
             file_id = parse_file_id(path)
             if file_id is None:
                 continue        # 名字不是我们的格式,不碰
-            with SSTableReader(path, file_id) as reader:
+            with SSTableReader(path, file_id, cache=self._block_cache) as reader:
                 if reader.entry_count == 0:
                     continue    # 空表不该存在,忽略
                 self._manifest.levels[0].append(
@@ -322,7 +349,9 @@ class LSMEngine:
         for meta in self._manifest.files():
             path = self.data_dir / sstable_filename(meta.file_id)
             try:
-                self._readers[meta.file_id] = SSTableReader(path, meta.file_id)
+                self._readers[meta.file_id] = SSTableReader(
+                    path, meta.file_id, cache=self._block_cache
+                )
             except CorruptionError as exc:
                 raise CorruptionError(
                     f"SSTable 损坏,拒绝以可能丢数据的方式启动:{path}"
@@ -431,7 +460,11 @@ class LSMEngine:
             final_path = self.data_dir / sstable_filename(file_id)
             tmp_path = self.data_dir / f"sst-{file_id:06d}{SSTABLE_TMP_SUFFIX}"
 
-            writer = SSTableWriter(tmp_path, block_size=self._sstable_block_size)
+            writer = SSTableWriter(
+                tmp_path,
+                block_size=self._sstable_block_size,
+                bloom_bits_per_key=self._bloom_bits_per_key,
+            )
             try:
                 for key, value in entries:
                     writer.add(key, value)
@@ -446,7 +479,7 @@ class LSMEngine:
             self._sync_dir()
 
             try:
-                reader = SSTableReader(final_path, file_id)
+                reader = SSTableReader(final_path, file_id, cache=self._block_cache)
             except CorruptionError:
                 final_path.unlink(missing_ok=True)
                 raise
@@ -592,7 +625,9 @@ class LSMEngine:
                     self._next_file_id += 1
                     tmp_path = self.data_dir / f"sst-{file_id:06d}{SSTABLE_TMP_SUFFIX}"
                     writer = SSTableWriter(
-                        tmp_path, block_size=self._sstable_block_size
+                        tmp_path,
+                        block_size=self._sstable_block_size,
+                        bloom_bits_per_key=self._bloom_bits_per_key,
                     )
 
                 writer.add(key, value)
@@ -656,9 +691,14 @@ class LSMEngine:
             reader = self._readers.pop(meta.file_id, None)
             if reader is not None:
                 reader.close()
+            # 顺手把它在缓存里的块清掉。不清也不会读到脏数据(file_id
+            # 不复用),但这些块再也不会被访问,留着纯粹是占内存。
+            self._block_cache.evict_file(meta.file_id)
         for meta in added:
             path = self.data_dir / sstable_filename(meta.file_id)
-            self._readers[meta.file_id] = SSTableReader(path, meta.file_id)
+            self._readers[meta.file_id] = SSTableReader(
+                path, meta.file_id, cache=self._block_cache
+            )
 
         # manifest 已经不再引用这些文件了,现在删才安全
         for meta in removed:
@@ -667,7 +707,12 @@ class LSMEngine:
     # ------------------------------------------------------------ 读取
 
     def get(self, key: object) -> bytes | None:
-        """查询键。返回 ``None`` 表示不存在或已被删除。"""
+        """查询键。返回 ``None`` 表示不存在或已被删除。
+
+        每一层都先问布隆过滤器"这个文件里一定没有这个 key 吗":
+        答"一定没有"就跳过,**一次磁盘读都省了**。这是阶段 4 的主要收益 ——
+        查不存在的键不再需要把每层都真读一遍。
+        """
         kb = to_bytes(key, "key")
 
         with self._lock:
@@ -680,7 +725,11 @@ class LSMEngine:
 
             # L0:键范围互相重叠,只能从新到旧挨个试
             for meta in self._manifest.levels[0]:
-                found, value = self._readers[meta.file_id].get(kb)
+                reader = self._readers[meta.file_id]
+                if not reader.might_contain(kb):
+                    self._bloom_rejections += 1
+                    continue
+                found, value = reader.get(kb)
                 if found:
                     return value    # 墓碑同样在这里终止查找
 
@@ -689,7 +738,11 @@ class LSMEngine:
                 meta = self._manifest.find_file(level, kb)
                 if meta is None:
                     continue
-                found, value = self._readers[meta.file_id].get(kb)
+                reader = self._readers[meta.file_id]
+                if not reader.might_contain(kb):
+                    self._bloom_rejections += 1
+                    continue
+                found, value = reader.get(kb)
                 if found:
                     return value
             return None
@@ -772,6 +825,11 @@ class LSMEngine:
                     self._manifest.level_bytes(index)
                     for index in range(self._num_levels)
                 ],
+                bloom_rejections=self._bloom_rejections,
+                bloom_corrupt_files=sum(
+                    1 for reader in self._readers.values() if reader.bloom_corrupt
+                ),
+                cache=self._block_cache.stats(),
             )
 
     @property
@@ -796,6 +854,16 @@ class LSMEngine:
     @property
     def num_levels(self) -> int:
         return self._num_levels
+
+    @property
+    def block_cache(self) -> BlockCache:
+        """引擎共用的块缓存。测试和诊断用。"""
+        return self._block_cache
+
+    @property
+    def bloom_bits_per_key(self) -> int:
+        """写新文件时给布隆过滤器分配的 bits/key(0 表示不写过滤器)。"""
+        return self._bloom_bits_per_key
 
     # ------------------------------------------------------------ 生命周期
 

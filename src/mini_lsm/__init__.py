@@ -4,6 +4,7 @@
     阶段 1  WAL 预写日志 + MemTable 内存表 + 崩溃恢复
     阶段 2  SSTable 刷盘 + 多来源读路径(数据量不再受内存限制)
     阶段 3  Manifest + 分层 Compaction(控制读放大,清理墓碑)
+    阶段 4  Bloom Filter + Block Cache(消掉无谓的磁盘读)
 
 快速开始::
 
@@ -25,6 +26,13 @@
 所以数据量可以远超内存,查询也不会随文件数线性变慢。
 """
 
+from .block_cache import DEFAULT_CACHE_BYTES, BlockCache, CacheStats
+from .bloom import (
+    DEFAULT_BITS_PER_KEY,
+    BloomBuilder,
+    BloomFilter,
+    estimate_false_positive_rate,
+)
 from .compaction import (
     CompactionTask,
     level_budget,
@@ -60,7 +68,12 @@ from .record import (
 )
 from .sstable import (
     DEFAULT_BLOCK_SIZE,
+    FOOTER_MAGIC,
+    FOOTER_MAGIC_V1,
+    FOOTER_MAGIC_V2,
     FOOTER_SIZE,
+    FOOTER_SIZE_V1,
+    FORMAT_VERSION,
     SSTableMeta,
     SSTableReader,
     SSTableWriter,
@@ -70,7 +83,7 @@ from .sstable import (
 )
 from .wal import ReplayResult, WAL, read_records
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     # 主入口
@@ -90,6 +103,20 @@ __all__ = [
     "read_all",
     "DEFAULT_BLOCK_SIZE",
     "FOOTER_SIZE",
+    "FOOTER_SIZE_V1",
+    "FOOTER_MAGIC",
+    "FOOTER_MAGIC_V1",
+    "FOOTER_MAGIC_V2",
+    "FORMAT_VERSION",
+    # 布隆过滤器
+    "BloomFilter",
+    "BloomBuilder",
+    "DEFAULT_BITS_PER_KEY",
+    "estimate_false_positive_rate",
+    # 块缓存
+    "BlockCache",
+    "CacheStats",
+    "DEFAULT_CACHE_BYTES",
     # 版本清单
     "Manifest",
     "FileMeta",
