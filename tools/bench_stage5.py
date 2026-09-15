@@ -198,6 +198,18 @@ def bench_scan_memory(data_dir: Path) -> None:
         print(f"  → 只要头几条的话,阶段 4 必须等完整趟;现在几乎立刻就有。")
 
 
+def engine_locks_free(db: LSMEngine) -> bool:
+    """引擎的三把锁是不是都空闲。
+
+    阶段 6 把一把大锁拆成了三把(维护 / 追加 / 状态),所以"锁空闲"
+    也要三把一起看 —— 只探其中一把,漏掉的那把正被占着也看不出来。
+    """
+    return all(
+        try_acquire(lock)
+        for lock in (db._maintenance_lock, db._append_lock, db._state_lock)
+    )
+
+
 def bench_lock_free(data_dir: Path) -> None:
     print("\n" + "=" * 76)
     print("二、迭代期间引擎锁是空闲的(读不阻塞写)")
@@ -206,12 +218,12 @@ def bench_lock_free(data_dir: Path) -> None:
     with LSMEngine(data_dir, memtable_capacity=MEMTABLE_CAPACITY) as db:
         cursor = db.scan()
         next(cursor)                    # 迭代已经开始
-        free_during = try_acquire(db._lock)
+        free_during = engine_locks_free(db)
         cursor.close()
 
-        free_idle = try_acquire(db._lock)
-        print(f"  空闲时锁可用:   {'是' if free_idle else '否'}")
-        print(f"  扫描中锁可用:   {'是' if free_during else '否'}")
+        free_idle = engine_locks_free(db)
+        print(f"  空闲时三把锁都可用: {'是' if free_idle else '否'}")
+        print(f"  扫描中三把锁都可用: {'是' if free_during else '否'}")
         print("\n  阶段 4 是「锁内物化成 list」—— 扫一个大库,写会被卡住全程。")
         print("  现在迭代期间不持锁,靠 pin 住文件保证数据还在。")
         assert free_during and free_idle

@@ -22,7 +22,7 @@ import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Iterable
 
 from .errors import CorruptionError, LSMError
 from .record import HEADER_SIZE, Record, RecordType, encode_record, iter_records
@@ -210,6 +210,54 @@ class WAL:
             self._size = 0
             return
         self._truncate(0)
+
+    def rewrite(self, items: Iterable[tuple[bytes, bytes | None]]) -> int:
+        """用给定的键值对**整体替换**日志内容,返回重写后的字节数。
+
+        它解决的是"刷盘之后日志里留下一段已经进了 SSTable 的记录"这个问题。
+        为什么不能简单截断:并发写入时,内存表已经换成了新的那一张,
+        而日志的前半段属于**刚刚被刷走**的那张表。截断会把新表的数据一起丢掉。
+
+        于是这里改成"重写":把**当前内存表**的内容原样写进新日志。
+        顺带得到一个好处 —— **日志被去重了**。内存表里每个键只有一条记录,
+        而原日志里同一个键可能被追加过很多次,所以重写后通常小得多。
+
+        崩溃安全(和 SSTable、manifest 用同一套办法):
+            先写 ``wal.log.tmp`` 并 fsync,再 ``os.replace`` 原子改名。
+            改名**之前**崩溃:旧日志(更长、含多余记录)仍然完好,
+            重放它是幂等的 —— 那些记录的值和 SSTable 里的一致。
+            改名**之后**崩溃:新日志恰好等于内存表内容。
+            两种情况下数据都不会丢。
+
+        ⚠️ 调用方必须保证重写期间**没有别的线程在 append** ——
+        否则那条追加会落在被替换掉的旧文件里,凭空消失。
+        引擎侧靠 ``_append_lock`` 保证这一点。
+        """
+        with self._lock:
+            self._ensure_open()
+
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            size = 0
+            with open(tmp, "wb") as fh:
+                for key, value in items:
+                    if value is None:
+                        payload = encode_record(RecordType.DELETE, key)
+                    else:
+                        payload = encode_record(RecordType.PUT, key, value)
+                    fh.write(payload)
+                    size += len(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+
+            # Windows 上目标文件被打开时 ``os.replace`` 会失败,必须先关掉。
+            # 而且这个句柄指向的是**被替换掉的旧文件**,留着也写不进去了。
+            if self._fh is not None:
+                self._fh.close()
+                self._fh = None
+
+            os.replace(tmp, self.path)
+            self._size = size
+            return size
 
     # ------------------------------------------------------------ 生命周期
 

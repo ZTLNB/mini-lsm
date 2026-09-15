@@ -22,6 +22,13 @@
     6. 读的时候有一致视图 —— 快照创建之后的写入/删除/刷盘/归并
        对它一律不可见。代价是文件被 pin 住,必须记得关。
 
+阶段 6 让写不必再陪着磁盘一起等:
+    7. 刷盘写文件的那段时间里,写入和读取都照常进行 ——
+       内存表在写文件**之前**就被轮转走了,新写入落进新表
+    8. 被轮转走的那批数据暂时只存在于"不可变内存表"里,
+       读路径必须找得到它(漏掉就是"偶发查不到刚写的数据")
+    9. 多线程写入时数据一条不少,重启后重放 WAL 的结果和关闭前一致
+
 用法::
 
     python demo.py
@@ -33,15 +40,19 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
+import mini_lsm.engine as engine_mod  # noqa: E402
 from mini_lsm import (  # noqa: E402
     MANIFEST_FILENAME,
     LSMEngine,
     RecordType,
     SSTableReader,
+    SSTableWriter,
     WAL,
     read_records,
 )
@@ -74,6 +85,24 @@ def layout(db: LSMEngine) -> str:
         if files
     ]
     return "  ".join(parts) if parts else "(没有文件)"
+
+
+def blocking_writer(entered: threading.Event, release: threading.Event):
+    """造一个"收尾时会卡住"的 SSTableWriter,好把"正在写文件"这一刻钉死。
+
+    并发演示最容易写成"sleep 一会儿再断言"。但刷盘可能比 sleep 还快,
+    结论就成了碰运气 —— 而且失败时看起来像是实现有问题。
+    这里用两个事件把时序固定下来:``finish()`` 一进来就发信号,
+    然后一直等到演示放行。
+    """
+
+    class BlockingWriter(SSTableWriter):
+        def finish(self):
+            entered.set()
+            release.wait(timeout=30)
+            return super().finish()
+
+    return BlockingWriter
 
 
 def demo() -> None:
@@ -473,10 +502,90 @@ def demo() -> None:
             print("  → 所以快照一定要关。它不是内存泄漏,是**磁盘**泄漏。")
             print("    用 with 语句是最省心的方式。")
 
+        section(17, "并发写:刷盘的时候,写入和读取都不被挡住")
+        with LSMEngine(data_dir, memtable_capacity=1 << 20) as db:
+            db.put("before", "1")
+
+            entered, release = threading.Event(), threading.Event()
+
+            def flusher() -> None:
+                db.flush()
+
+            with mock.patch.object(
+                engine_mod, "SSTableWriter", blocking_writer(entered, release)
+            ):
+                thread = threading.Thread(target=flusher, daemon=True)
+                thread.start()
+                try:
+                    entered.wait(timeout=30)
+                    print("  刷盘进行中(SSTable 卡在写文件那一步):")
+                    print(f"    不可变内存表 {db.immutable_entries} 条,"
+                          f" SSTable 还没写完")
+
+                    db.put("during", "2")
+                    print(f"    此刻写入 during = {db.get_str('during')}"
+                          f"   ← 没被挡住")
+                    print(f"    被轮转走的 before = {db.get_str('before')}"
+                          f"   ← 从不可变内存表里读到")
+                finally:
+                    release.set()
+                    thread.join(timeout=30)
+
+            print(f"  刷盘结束后:不可变内存表 {db.immutable_entries} 条,"
+                  f" 两条都读得到")
+            print("  → 数据在写文件**之前**就已经从内存表里搬走了(搬进不可变表),")
+            print("    所以写者不用等。代价是读路径多了一层 —— 漏掉它就是")
+            print("    「刷盘那一瞬间偶发查不到刚写的数据」。")
+
+        section(18, "并发写:数据一条不少,重启后一致")
+        threads, per_thread = 4, 200
+        with LSMEngine(data_dir, memtable_capacity=512) as db:
+            def worker(index: int) -> None:
+                for item in range(per_thread):
+                    db.put(f"t{index}-k{item:03d}", f"v{index}-{item}")
+
+            workers = [
+                threading.Thread(target=worker, args=(index,))
+                for index in range(threads)
+            ]
+            for item in workers:
+                item.start()
+            for item in workers:
+                item.join(timeout=60)
+
+            stats = db.stats()
+            print(f"  {threads} 个线程各写 {per_thread} 条,"
+                  f"内存表容量只有 512 字节")
+            print(f"    刷盘 {stats.flushes} 次,归并 {stats.compactions} 次,"
+                  f" WAL 整体重写 {stats.wal_rewrites} 次")
+
+            def mismatches() -> int:
+                return sum(
+                    1
+                    for index in range(threads)
+                    for item in range(per_thread)
+                    if db.get_str(f"t{index}-k{item:03d}") != f"v{index}-{item}"
+                )
+
+            print(f"    读回来对不上的: {mismatches()} 条")
+
+        with LSMEngine(data_dir) as db:
+            after = sum(
+                1
+                for index in range(threads)
+                for item in range(per_thread)
+                if db.get_str(f"t{index}-k{item:03d}") != f"v{index}-{item}"
+            )
+            print(f"  关掉重开(重放 WAL),对不上的: {after} 条")
+            print("  → 并发下 WAL 不能直接清空了:日志里夹着新内存表的记录,")
+            print("    清掉就丢数据。所以改成「用当前内存表整体替换日志」——")
+            print("    顺带还把重复的键压掉了。")
+
         rule("数据不丢;半截记录被丢弃;归并让文件数不随写入量线性增长;"
              "墓碑在压到最底层后被真正清掉;"
              "布隆过滤器挡掉不存在的键;块缓存让热点数据不再重复读盘;"
-             "扫描流式进行且不阻塞写入;快照给读一个一致视图")
+             "扫描流式进行且不阻塞写入;快照给读一个一致视图;"
+             "刷盘和归并的慢 I/O 全程在锁外,写和读都不陪着等磁盘")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

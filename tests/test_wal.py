@@ -216,5 +216,99 @@ class TestLifecycle(WALTestCase):
         self.assertEqual(result.record_count, 2)
 
 
+class TestRewrite(WALTestCase):
+    """``rewrite`` 用给定内容整体替换日志。
+
+    引擎在"刷盘之后、日志里还留着新内存表记录"时用它(见 ``engine.py``
+    的 ``_rewrite_or_truncate_wal_locked``)。这里只测它自己的行为。
+    """
+
+    def test_replaces_all_content(self):
+        with WAL(self.path) as wal:
+            wal.append(RecordType.PUT, b"old1", b"x")
+            wal.append(RecordType.PUT, b"old2", b"y")
+            wal.rewrite([(b"new", b"z")])
+
+        result = read_records(self.path)
+        self.assertEqual(result.record_count, 1)
+        self.assertEqual(result.records[0].key, b"new")
+        self.assertEqual(result.records[0].value, b"z")
+
+    def test_returns_written_bytes(self):
+        expected = len(encode_record(RecordType.PUT, b"k", b"v"))
+        with WAL(self.path) as wal:
+            written = wal.rewrite([(b"k", b"v")])
+
+        self.assertEqual(written, expected)
+        self.assertEqual(written, os.path.getsize(self.path))
+
+    def test_size_tracks_rewrite(self):
+        with WAL(self.path) as wal:
+            wal.append(RecordType.PUT, b"a" * 100, b"b" * 100)
+            before = wal.size
+            wal.rewrite([(b"k", b"v")])
+
+            self.assertLess(wal.size, before)
+            self.assertEqual(wal.size, os.path.getsize(self.path))
+
+    def test_tombstone_becomes_delete_record(self):
+        """值为 None 表示墓碑,要写成 DELETE 而不是 PUT。"""
+        with WAL(self.path) as wal:
+            wal.rewrite([(b"alive", b"v"), (b"dead", None)])
+
+        result = read_records(self.path)
+        types = {rec.key: rec.rec_type for rec in result.records}
+        self.assertEqual(types[b"alive"], RecordType.PUT)
+        self.assertEqual(types[b"dead"], RecordType.DELETE)
+
+    def test_append_continues_after_rewrite(self):
+        """重写之后写句柄必须还能用 —— 它指向的是被替换掉的旧文件,
+        没重新打开的话后续追加会全部丢失。"""
+        with WAL(self.path) as wal:
+            wal.append(RecordType.PUT, b"old", b"x")
+            wal.rewrite([(b"kept", b"1")])
+            wal.append(RecordType.PUT, b"after", b"2")
+
+        result = read_records(self.path)
+        keys = [rec.key for rec in result.records]
+        self.assertEqual(keys, [b"kept", b"after"])
+
+    def test_rewrite_to_empty(self):
+        with WAL(self.path) as wal:
+            wal.append(RecordType.PUT, b"k", b"v")
+            wal.rewrite([])
+
+            self.assertEqual(wal.size, 0)
+            self.assertEqual(os.path.getsize(self.path), 0)
+
+    def test_rewrite_is_atomic_via_tmp_file(self):
+        """改名是原子的,所以不留临时文件。"""
+        with WAL(self.path) as wal:
+            wal.rewrite([(b"k", b"v")])
+
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        self.assertFalse(tmp.exists())
+        self.assertTrue(self.path.exists())
+
+    def test_rewrite_dedupes(self):
+        """同一个键写了 50 次,重写后只剩 1 条 —— 日志被压实了。"""
+        with WAL(self.path) as wal:
+            for index in range(50):
+                wal.append(RecordType.PUT, b"same", str(index).encode())
+            self.assertEqual(read_records(self.path).record_count, 50)
+
+            wal.rewrite([(b"same", b"49")])
+
+        result = read_records(self.path)
+        self.assertEqual(result.record_count, 1)
+        self.assertEqual(result.records[0].value, b"49")
+
+    def test_rewrite_on_closed_wal_raises(self):
+        wal = WAL(self.path)
+        wal.close()
+        with self.assertRaises(LSMError):
+            wal.rewrite([(b"k", b"v")])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

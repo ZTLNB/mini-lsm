@@ -14,7 +14,50 @@
     "内存表副本 + 层结构副本 + 一批被 pin 住的文件"。
 
     仍然没有的东西:没有 per-key 版本链(所以不支持"读历史某个时间点"),
-    没有并发写(写仍然靠一把大锁串行化),没有事务。
+    没有事务。
+
+---
+阶段 6:并发写(见下)
+
+    阶段 5 结束时,读已经不阻塞写了,但**写和写之间、写和 compaction
+    之间仍然互斥** —— 因为 ``put``/``flush``/``compaction`` 共用同一把
+    可重入锁,而 ``flush`` 和 ``compaction`` 内部有大量磁盘 I/O。
+    一把锁把"改一个字节的内存"和"写几 MB 的文件"保护在同一个临界区里,
+    代价完全不成比例。
+
+    这一版把一把大锁拆成三把,并引入**不可变内存表**:
+
+        _maintenance_lock  串行化刷盘与归并(同一时刻只有一个维护操作)
+        _append_lock       WAL 追加 + 内存表写入 + 内存表轮转
+        _state_lock        结构状态(manifest、readers、快照、计数器)
+
+    加锁顺序固定为 ``maintenance → append → state``,任何地方都不许反向。
+
+    关键变化是**刷盘时只换指针,不搬数据**:
+
+        内存表写满
+          → 在 _append_lock 里把指针换掉(微秒级):
+              满的那张变成"不可变内存表",新建一张空表接住后续写入
+          → 释放 _append_lock,让其他写者继续往新表里写
+          → 在锁外把不可变表慢慢写成 SSTable
+          → 最后才更新 manifest、摘掉不可变表、重写 WAL
+
+    于是:写入只在"换指针"那一瞬间被挡一下,不再陪着刷盘一起等磁盘。
+    归并同理 —— 归并的慢 I/O 全程在 ``_state_lock`` 之外,所以
+    **读也不会被归并卡住**(阶段 5 时读是要等的)。
+
+    代价与新增的约束:
+
+    - 读路径多了一层:活动内存表 → **不可变内存表** → L0 → L1……
+      漏掉中间那一层,刷盘期间就会"偶发查不到刚写的数据"。
+    - WAL 不能简单截断了。刷盘期间日志里同时有"刚被刷走的表"和
+      "正在写的表"两段记录,截断会丢后者。所以改成 ``WAL.rewrite``:
+      用当前内存表的内容整体替换日志,顺带去重(见 ``wal.py``)。
+    - 崩溃恢复不需要改:日志里多出来的那一段(属于已刷盘的表)重放是
+      幂等的,值本来就一致。半截的 ``wal.log.tmp`` 启动时清掉即可。
+
+    参考:``_rotate_locked`` / ``_flush_immutable_locked`` /
+    ``_rewrite_or_truncate_wal_locked``。
 
 写路径(必须严格保持这个顺序):
     1. 先把变更追加到 WAL        ← 落盘,这是持久性的来源
@@ -24,8 +67,14 @@
     顺序不能反。如果先改内存再写日志,那么"日志还没写完就崩溃"
     的情况下,内存里的改动会丢失,而调用方已经收到"成功"了。
 
+    并发写入时,"1 和 2 必须是一个原子步骤"这个要求变得更要紧:
+    如果两个线程各自追加了日志、却按相反的顺序改了内存表,那么重启重放
+    日志得到的顺序就和崩溃前内存里的顺序不一致 —— 同一个键的最终值可能
+    对不上。``_append_lock`` 保护的正是这一对操作。
+
 读路径(从新到旧,先命中先返回):
-    内存表
+    活动内存表
+      → 不可变内存表(只在刷盘期间存在)
       → L0 从新到旧逐个试(键范围重叠,没法二分)
       → L1、L2…… 二分定位到唯一可能包含它的文件(层内不重叠)
     墓碑会**终止**查找 —— 它表示"这个键在此刻被删了",
@@ -42,6 +91,10 @@
 
     快照给这条原则加了一个附加条件:**被快照 pin 住的文件不能删**,
     只能推迟到最后一个引用它的快照关闭之后再删(见 ``_pending_delete``)。
+
+    并发写入再给刷盘加了一个附加条件:**不可变内存表只有在 manifest
+    已经指向它的 SSTable 之后才能摘掉**。反过来的话,那张表既不在内存里、
+    也不在 manifest 里,它的数据就只靠 WAL 兜着 —— 而 WAL 可能已经被重写了。
 """
 
 from __future__ import annotations
@@ -92,6 +145,13 @@ DEFAULT_TARGET_FILE_SIZE = 2 * 1024 * 1024
 #: maybe_compact 的轮数上界。策略正确时几轮就收敛,这个上界只是防死循环。
 DEFAULT_MAX_COMPACTION_ROUNDS = 16
 
+#: 内存表涨到容量的多少倍时,写入必须排队等刷盘(背压)。
+#:
+#: 平时写入**不排队** —— 抢不到维护权就直接返回,数据交给正在刷的那个人。
+#: 但如果内存表已经涨到两倍容量还没人把它刷出去,说明写入速度已经超过
+#: 刷盘速度了,这时候必须真的等一等,否则内存会被撑爆。
+MEMTABLE_STALL_FACTOR = 2
+
 
 @dataclass
 class EngineStats:
@@ -113,6 +173,21 @@ class EngineStats:
     compactions: int = 0
     level_files: list[int] = field(default_factory=list)
     level_bytes: list[int] = field(default_factory=list)
+
+    immutable_entries: int = 0
+    """不可变内存表里的条目数。**只在刷盘期间大于 0**。
+
+    它长期不为 0 说明有个刷盘卡住了 —— 那期间所有写入都压在这一层里,
+    而它占的内存是活动内存表的整整一倍。
+    """
+    immutable_bytes: int = 0
+    """不可变内存表的估算字节数。"""
+    wal_rewrites: int = 0
+    """WAL 被整体重写的次数。
+
+    只在"刷盘后日志里还留着新内存表的记录"时才会发生(见 ``WAL.rewrite``);
+    单线程顺序写入时内存表总是被刷空,所以这个数会一直是 0,走的是更便宜的截断。
+    """
 
     bloom_rejections: int = 0
     """布隆过滤器挡下了多少次文件读 —— 也就是省掉了多少次磁盘 I/O。"""
@@ -141,8 +216,17 @@ class EngineStats:
             f"内存表: {self.memtable_entries} 条,"
             f" {self.memtable_size} / {self.memtable_capacity} 字节"
             f" ({self.memtable_usage_ratio:.1%})",
+        ]
+        if self.immutable_entries or self.immutable_bytes:
+            lines.append(
+                f"不可变: {self.immutable_entries} 条,"
+                f" {self.immutable_bytes} 字节  ← 正在刷盘,写入不受它影响"
+            )
+        lines += [
             f"墓碑:   {self.tombstones} 个",
-            f"WAL:    {self.wal_size} 字节",
+            f"WAL:    {self.wal_size} 字节"
+            + (f"(整体重写 {self.wal_rewrites} 次)"
+               if self.wal_rewrites else ""),
             f"待刷盘: {'是' if self.flush_pending else '否'}",
             f"SSTable: {self.sstable_count} 个文件,"
             f" {self.sstable_entries} 条,{self.sstable_bytes} 字节",
@@ -233,9 +317,38 @@ class LSMEngine:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.wal_path = self.data_dir / WAL_FILENAME
 
-        self._lock = threading.RLock()
+        # 三把锁,职责严格分开。加锁顺序固定为
+        #     _maintenance_lock → _append_lock → _state_lock
+        # 任何地方都不许反向获取,否则就是死锁。
+        #
+        # 为什么不继续用一把大锁:刷盘和归并内部有大量磁盘 I/O,
+        # 而写入只是"追加几字节 + 改一个 dict 项"。让这两件事抢同一把锁,
+        # 等于每次刷盘都把整个库停掉。
+        self._maintenance_lock = threading.RLock()
+        """串行化刷盘与归并 —— 同一时刻只允许一个维护操作在跑。
+
+        它们都会改 manifest,而 manifest 是"整体原子替换"的:
+        两个维护操作同时改,后写的那次会把前一次的改动整个覆盖掉,
+        文件就从清单里凭空消失。所以这里必须串行。
+        """
+        self._append_lock = threading.RLock()
+        """保护 WAL 追加 + 内存表写入 + 内存表轮转这一组操作。
+
+        这三件事必须**成组原子**:日志里的顺序就是崩溃后重放出来的顺序,
+        而内存表里的顺序决定了"同一个键谁赢"。两者不一致,
+        重启前后的数据就会对不上(详见模块开头"写路径"一节)。
+        """
+        self._state_lock = threading.RLock()
+        """保护结构状态:manifest、readers、快照表、待删清单、计数器。
+
+        它**绝不在磁盘 I/O 期间持有** —— 这正是"归并不卡读"的原因。
+        """
+
         self._closed = False
         self._memtable = MemTable(memtable_capacity)
+        #: 正在刷盘的那张内存表。正常情况下是 None;
+        #: 只有"满了、指针已经换掉、但还没写成 SSTable"这段时间才非空。
+        self._immutable: MemTable | None = None
         self._sstable_block_size = sstable_block_size
         self._auto_flush = auto_flush
         self._auto_compact = auto_compact
@@ -249,6 +362,7 @@ class LSMEngine:
         self._flush_count = 0
         self._compaction_count = 0
         self._bloom_rejections = 0
+        self._wal_rewrite_count = 0
         self._readers: dict[int, SSTableReader] = {}
         self._next_file_id = 1
 
@@ -281,10 +395,15 @@ class LSMEngine:
         """从 manifest 恢复"当前有效的文件集合",并打开它们。"""
         manifest_path = self.data_dir / MANIFEST_FILENAME
 
-        # 崩溃留下的半截文件:临时数据文件和临时 manifest 都清掉
+        # 崩溃留下的半截文件:临时数据文件、临时 manifest、临时 WAL 都清掉。
+        #
+        # 半截的 wal.log.tmp 可以放心删:它只在 "WAL.rewrite 写完临时文件、
+        # 但还没来得及原子改名" 这个窗口里存在。那时正式的 wal.log 仍然完好
+        # (它比临时文件更旧、更长),重放它得到的状态是对的 —— 见 WAL.rewrite。
         for stale in self.data_dir.glob(f"*{SSTABLE_TMP_SUFFIX}"):
             stale.unlink(missing_ok=True)
         manifest_path.with_name(manifest_path.name + ".tmp").unlink(missing_ok=True)
+        self.wal_path.with_name(self.wal_path.name + ".tmp").unlink(missing_ok=True)
 
         self._manifest = Manifest(manifest_path, self._num_levels)
 
@@ -419,15 +538,13 @@ class LSMEngine:
         先写 WAL(持久化),再改内存表。返回即代表数据已经"不会因
         进程崩溃而丢失"(前提是 ``wal_sync_on_write`` 为 True 时才能
         扛住断电,否则只扛得住进程崩溃)。
+
+        **多个线程可以同时调用它。** 互相之间只在"追加日志 + 改内存表"
+        这一小段上排队,不会陪着别人的刷盘一起等磁盘。
         """
         kb = to_bytes(key, "key")
         vb = to_bytes(value, "value")
-
-        with self._lock:
-            self._ensure_open()
-            self._wal.append(RecordType.PUT, kb, vb)
-            self._memtable.put(kb, vb)
-            self._after_write()
+        self._write_record(RecordType.PUT, kb, vb)
 
     def delete(self, key: object) -> None:
         """删除一个键。
@@ -436,17 +553,65 @@ class LSMEngine:
         要等到 compaction 压到最底层才会被真正清除。
         """
         kb = to_bytes(key, "key")
+        self._write_record(RecordType.DELETE, kb)
 
-        with self._lock:
+    def _write_record(
+        self, rec_type: RecordType, kb: bytes, vb: bytes = b""
+    ) -> None:
+        """写入路径的唯一入口:``put`` 和 ``delete`` 都走这里。
+
+        ``_append_lock`` 只圈住"追加日志 + 改内存表"这两步,因为
+        它们必须是一个原子步骤(理由见模块开头的"写路径"一节)。
+
+        ⚠️ 触发刷盘的判断**必须在释放 _append_lock 之后**才处理。
+        刷盘要写几 MB 的文件,如果占着 ``_append_lock`` 去写,
+        其他写者就只能干等 —— 那和不拆锁没有任何区别。
+        """
+        with self._append_lock:
             self._ensure_open()
-            self._wal.append(RecordType.DELETE, kb)
-            self._memtable.delete(kb)
+            self._wal.append(rec_type, kb, vb)
+            if rec_type is RecordType.DELETE:
+                self._memtable.delete(kb)
+            else:
+                self._memtable.put(kb, vb)
+            full = self._memtable.is_full
+
+        if full and self._auto_flush:
             self._after_write()
 
     def _after_write(self) -> None:
-        """写入之后的维护动作。"""
-        if self._auto_flush and self._memtable.is_full:
-            self.flush()
+        """写入之后的维护动作:内存表满了就把它刷出去。
+
+        ⚠️ **抢不到维护权就直接返回,不排队**。这是这里最容易被写错的地方。
+
+        排队看起来更"安全",实际上是白等:这一刻内存表满了,但我们的数据
+        已经在 WAL 和内存表里了 —— 它不会丢,也不需要立刻变成 SSTable。
+        而正在刷的那个人刷完之后会顺手再看一眼内存表(见 ``_drain_locked``),
+        该刷的会一起刷掉。
+
+        为什么非要这么抠:``_drain_locked`` 里除了刷盘还会跑 ``maybe_compact``,
+        而它最多可以跑 ``DEFAULT_MAX_COMPACTION_ROUNDS`` 轮。让一堆写者
+        排在后面等一场完整的刷盘 + 归并,尾延迟会难看到离谱
+        (实测:16 次维护里有 11 次是在白等,合计 2.7 秒)。
+
+        唯一的例外是内存表已经涨到 ``MEMTABLE_STALL_FACTOR`` 倍容量 ——
+        那说明写入比刷盘快,再不等就要把内存撑爆,这时候才真的排队(背压)。
+        """
+        if self._maintenance_lock.acquire(blocking=False):
+            try:
+                if not self._closed:
+                    self._drain_locked(force=False)
+            finally:
+                self._maintenance_lock.release()
+            return
+
+        memtable = self._memtable
+        if memtable.approximate_size >= (
+            MEMTABLE_STALL_FACTOR * memtable.capacity_bytes
+        ):
+            with self._maintenance_lock:
+                if not self._closed:
+                    self._drain_locked(force=False)
 
     def put_many(self, items: dict | list[tuple]) -> int:
         """批量写入,返回写入条数。
@@ -472,13 +637,20 @@ class LSMEngine:
     def flush(self) -> int:
         """把内存表刷成一个 SSTable,返回写入的条目数(0 表示没东西可刷)。
 
+        这是**显式**刷盘:不管内存表满没满都刷,把当前所有数据都落成文件。
+
         **步骤顺序是这个方法唯一重要的东西**:
 
-            1. 把内存表快照写成 SSTable 并 fsync   ← 数据先落到新地方
-            2. 原子改名成正式文件
-            3. 更新 manifest(L0 多了一个文件)      ← 从此它是"有效的一套"
-            4. 换一个空的内存表
-            5. 截断 WAL                            ← 最后才丢弃旧地方
+            1. 把内存表轮转掉(换指针)           ← 快,写者立刻可以继续
+            2. 把不可变表写成 SSTable 并 fsync   ← 数据先落到新地方(慢,不持锁)
+            3. 原子改名成正式文件
+            4. 更新 manifest(L0 多了一个文件)    ← 从此它是"有效的一套"
+            5. 摘掉不可变表
+            6. 重写/截断 WAL                     ← 最后才丢弃旧地方
+
+        第 1 步是阶段 6 才有的。阶段 5 里"写 SSTable"和"换内存表"是一起做的,
+        而且全程占着锁,所以刷盘期间谁也别想写。现在数据在写文件之前就已经
+        从内存表里搬走了(搬进不可变表),写者可以立刻往新表里写。
 
         任何一步之后崩溃都是安全的:只要 WAL 还在,重放一遍就能重建内存表。
         重放是幂等的 —— 同样的 put 应用两次,结果一样。
@@ -486,65 +658,167 @@ class LSMEngine:
         墓碑也会被写进 SSTable。不能在这里丢掉它们:
         更旧的 SSTable 里可能还有这个键的值,墓碑是唯一能压住它的东西。
         """
-        with self._lock:
+        with self._maintenance_lock:
             self._ensure_open()
+            return self._drain_locked(force=True)
 
-            if len(self._memtable) == 0:
+    def _drain_locked(self, force: bool) -> int:
+        """把该刷的内存表都刷掉,返回写入的条目总数。**必须持有 _maintenance_lock**。
+
+        ``force=True`` 是显式 ``flush()`` 的语义:当前内存表也一起刷。
+        ``force=False`` 是自动维护的语义:**只刷满的**。这一条很重要 ——
+        自动路径如果也强制刷,那么每次内存表刚满、并发写入又刚好填了一点,
+        就会不停地把半满的表也刷出去,文件数会失控。
+        """
+        total = 0
+
+        # 先把积压的不可变表刷掉。它比当前内存表旧,必须先落地 ——
+        # 否则后刷的(更新的)数据会排在它前面,读的时候旧值会盖住新值。
+        while self._immutable is not None:
+            total += self._flush_immutable_locked()
+
+        if force or self._memtable.is_full:
+            if len(self._memtable) > 0:
+                self._rotate_locked()
+                total += self._flush_immutable_locked()
+
+        if total and self._auto_compact:
+            self.maybe_compact()
+
+        return total
+
+    def _rotate_locked(self) -> None:
+        """把当前内存表换成一张空的,旧的那张变成不可变表。
+
+        **这是整个并发设计的关键一步**:它只做两次指针赋值,不碰磁盘,
+        所以耗时可忽略。写者最多在这里被挡一下,不用等刷盘。
+
+        为什么必须在 ``_append_lock`` 里做:轮转改变了"日志后半段对应哪张表"。
+        如果换指针的时候有线程正追加到一半,日志的顺序和内存表的顺序
+        就对不上了 —— 而崩溃恢复正是按日志顺序重放的。
+        """
+        with self._append_lock:
+            with self._state_lock:
+                old = self._memtable
+                self._immutable = old
+                self._memtable = MemTable(old.capacity_bytes)
+
+    def _flush_immutable_locked(self) -> int:
+        """把不可变内存表写成 SSTable,返回条目数。**必须持有 _maintenance_lock**。
+
+        这个方法里**没有一处长时间持锁** —— 这是它存在的全部意义。
+        每次需要碰共享状态时,都只短暂地取一下 ``_state_lock``:
+
+            取条目、分配 file_id   → 短暂持锁
+            写文件、fsync、改名     → 不持任何锁   ← 慢的地方
+            更新 manifest、摘表     → 短暂持锁
+            重写/截断 WAL           → 持 _append_lock(有界)
+        """
+        with self._state_lock:
+            imm = self._immutable
+            if imm is None:
                 return 0
+            entries = list(imm.items())         # 含墓碑
+            file_id = self._alloc_file_id()
 
-            entries = list(self._memtable.items())      # 含墓碑
-            file_id = self._next_file_id
-            final_path = self.data_dir / sstable_filename(file_id)
-            tmp_path = self.data_dir / f"sst-{file_id:06d}{SSTABLE_TMP_SUFFIX}"
+        if not entries:
+            # 轮转时不会换一张空表进来,所以这里理论上到不了。
+            # 真到了就摘掉它,否则上面的 while 会卡住。
+            with self._state_lock:
+                self._immutable = None
+            return 0
 
-            writer = SSTableWriter(
-                tmp_path,
-                block_size=self._sstable_block_size,
-                bloom_bits_per_key=self._bloom_bits_per_key,
-            )
-            try:
-                for key, value in entries:
-                    writer.add(key, value)
-                writer.finish()
-            except Exception:
-                writer.abort()
-                tmp_path.unlink(missing_ok=True)
-                raise
+        final_path = self.data_dir / sstable_filename(file_id)
+        tmp_path = self.data_dir / f"sst-{file_id:06d}{SSTABLE_TMP_SUFFIX}"
 
-            # 原子改名:要么看到完整的 .sst,要么看不到
-            os.replace(tmp_path, final_path)
-            self._sync_dir()
+        writer = SSTableWriter(
+            tmp_path,
+            block_size=self._sstable_block_size,
+            bloom_bits_per_key=self._bloom_bits_per_key,
+        )
+        try:
+            for key, value in entries:
+                writer.add(key, value)
+            writer.finish()
+        except Exception:
+            writer.abort()
+            tmp_path.unlink(missing_ok=True)
+            raise
 
-            try:
-                reader = SSTableReader(final_path, file_id, cache=self._block_cache)
-            except CorruptionError:
-                final_path.unlink(missing_ok=True)
-                raise
+        # 原子改名:要么看到完整的 .sst,要么看不到
+        os.replace(tmp_path, final_path)
+        self._sync_dir()
 
-            meta = FileMeta(
-                file_id=file_id,
-                level=0,
-                smallest=reader.first_key,
-                largest=reader.last_key,
-                entry_count=reader.entry_count,
-                size=reader.size,
-            )
+        try:
+            reader = SSTableReader(final_path, file_id, cache=self._block_cache)
+        except CorruptionError:
+            final_path.unlink(missing_ok=True)
+            raise
 
+        meta = FileMeta(
+            file_id=file_id,
+            level=0,
+            smallest=reader.first_key,
+            largest=reader.last_key,
+            entry_count=reader.entry_count,
+            size=reader.size,
+        )
+
+        with self._state_lock:
             # manifest 先指向新文件 —— 它已经 fsync 过了,可以安全被引用
             self._manifest.add(meta)
-            self._next_file_id = file_id + 1
             self._save_manifest()
 
             self._readers[file_id] = reader
-            self._memtable = MemTable(self._memtable.capacity_bytes)
             self._flush_count += 1
 
-            self._wal.truncate()
+            # ⚠️ 摘掉不可变表必须放在 manifest 更新**之后**。
+            # 反过来的话,会出现一个瞬间:数据既不在内存里、也不在 manifest 里。
+            # 如果恰好在那一刻崩溃,而 WAL 又已经被重写过,数据就真丢了。
+            self._immutable = None
 
-            if self._auto_compact:
-                self.maybe_compact()
+        self._rewrite_or_truncate_wal_locked()
+        return len(entries)
 
-            return len(entries)
+    def _rewrite_or_truncate_wal_locked(self) -> None:
+        """刷盘之后,把日志里"已经进了 SSTable 的那一段"丢掉。
+
+        **能截断就直接截断**:当前内存表是空的 —— 说明日志里全是刚刷走的那张表,
+        数据已经在 SSTable 里了,清掉即可。这是单线程顺序写入下的常态,
+        也是唯一一条不需要额外 I/O 的路径(所以这个项目里它的开销是 0)。
+
+        **否则整体重写**:并发写入时日志里还夹着新内存表的记录,截断会丢数据。
+        这时用当前内存表的内容整体替换日志 —— 顺带把重复的键去掉了
+        (内存表里每个键只有一条,而日志里同一个键可能追加过很多次)。
+
+        ⚠️ 重写期间必须独占 ``_append_lock``,理由见 ``WAL.rewrite``。
+        代价有界:最多是内存表容量那么多字节。
+        """
+        with self._append_lock:
+            with self._state_lock:
+                items = list(self._memtable.items())
+
+            if not items:
+                self._wal.truncate()
+                return
+
+            self._wal.rewrite(items)
+            self._sync_dir()
+
+            with self._state_lock:
+                self._wal_rewrite_count += 1
+
+    def _alloc_file_id(self) -> int:
+        """分配一个文件 id。**必须在 _state_lock 里调用**。
+
+        并发下这里必须是原子的:两个维护操作同时抢到同一个 id,
+        后写的那个会把前一个的文件覆盖掉,而 manifest 里两条记录指向同一个文件。
+        (``_maintenance_lock`` 已经保证了同一时刻只有一个维护操作,
+        但把 id 分配收进锁里更不容易出错,代价也可以忽略。)
+        """
+        file_id = self._next_file_id
+        self._next_file_id += 1
+        return file_id
 
     def _sync_dir(self) -> None:
         """把目录项刷到磁盘,确保改名结果持久化。
@@ -571,8 +845,11 @@ class LSMEngine:
         循环有上界。策略正确时几轮就收敛:一轮 L0 compaction 会把 L0 清空;
         往下一层压会让上一层变小。最底层不触发任务(见 ``pick_task`` 的
         循环上界),所以不存在"越压越多"的死循环。
+
+        ``_maintenance_lock`` 是**可重入**的,所以 ``flush()`` 内部可以直接
+        调它 —— 不需要"先放锁再取锁"那套绕法,也不会真的嵌套两次维护。
         """
-        with self._lock:
+        with self._maintenance_lock:
             self._ensure_open()
             rounds = 0
             while rounds < DEFAULT_MAX_COMPACTION_ROUNDS:
@@ -584,7 +861,7 @@ class LSMEngine:
                 )
                 if task is None:
                     break
-                self._run_compaction(task)
+                self._run_compaction_locked(task)
                 rounds += 1
             return rounds
 
@@ -593,7 +870,7 @@ class LSMEngine:
 
         想手动控制节奏时用它;想"该做就做"用 ``maybe_compact()``。
         """
-        with self._lock:
+        with self._maintenance_lock:
             self._ensure_open()
             task = pick_task(
                 self._manifest,
@@ -603,7 +880,7 @@ class LSMEngine:
             )
             if task is None:
                 return False
-            self._run_compaction(task)
+            self._run_compaction_locked(task)
             return True
 
     def compact_all(self) -> int:
@@ -612,27 +889,37 @@ class LSMEngine:
         这一步会**真正清掉墓碑**(压到最底层后不可能再有更旧的数据),
         并把文件数压到最少。手动整理和测试时用。
         """
-        with self._lock:
+        with self._maintenance_lock:
             self._ensure_open()
             task = plan_full_compaction(self._manifest)
             if task is None:
                 return 0
-            return self._run_compaction(task)
+            return self._run_compaction_locked(task)
 
-    def _run_compaction(self, task: CompactionTask) -> int:
-        """执行一次 compaction。
+    def _run_compaction_locked(self, task: CompactionTask) -> int:
+        """执行一次 compaction。**必须持有 _maintenance_lock**。
 
         顺序:
-            1. 归并输入,写成若干新文件并 fsync
+            1. 归并输入,写成若干新文件并 fsync   ← 慢 I/O,不持 _state_lock
             2. 原子更新 manifest —— 从此"有效的一套"就是新文件
             3. 换掉内存里的 reader
             4. 删旧文件 —— 到这里才安全,manifest 已经不引用它们了
+
+        为什么第 1 步可以不持 ``_state_lock``:
+            输入文件是不可变的(SSTable 写完之后从不修改),而且
+            ``_maintenance_lock`` 保证了没有别的维护操作会来删它们。
+            所以**读路径在这期间可以照常跑** —— 阶段 5 时两者是要互相等的,
+            归并一个几 MB 的库会把所有读卡住全程。
+
+        输入文件的 reader 也不会被谁关掉:能关 reader 的只有
+        ``_apply_compaction`` 和快照释放,而前者同样要 ``_maintenance_lock``。
         """
         added = self._merge_and_write(
             task.inputs, task.target_level, task.drop_tombstones
         )
-        self._apply_compaction(task.inputs, added)
-        self._compaction_count += 1
+        with self._state_lock:
+            self._apply_compaction(task.inputs, added)
+            self._compaction_count += 1
         return len(task.inputs)
 
     def _merge_and_write(
@@ -642,8 +929,14 @@ class LSMEngine:
 
         ``inputs`` 必须**按新到旧**排列 —— 归并时同 key 取谁完全由它决定。
         只写文件,不碰 manifest、不删旧文件。
+
+        整个方法跑在 ``_state_lock`` 之外(只在取 reader 和分配 file_id 时
+        短暂进去一下),所以归并期间读不会被卡住。
         """
-        sources = [self._readers[meta.file_id].iter_entries() for meta in inputs]
+        with self._state_lock:
+            sources = [
+                self._readers[meta.file_id].iter_entries() for meta in inputs
+            ]
         merged = MergingIterator(sources)
 
         added: list[FileMeta] = []
@@ -658,8 +951,8 @@ class LSMEngine:
                     continue
 
                 if writer is None:
-                    file_id = self._next_file_id
-                    self._next_file_id += 1
+                    with self._state_lock:
+                        file_id = self._alloc_file_id()
                     tmp_path = self.data_dir / f"sst-{file_id:06d}{SSTABLE_TMP_SUFFIX}"
                     writer = SSTableWriter(
                         tmp_path,
@@ -768,15 +1061,16 @@ class LSMEngine:
         要扫描区间直接用 ``db.scan()``(它内部就是这么做的),
         不需要自己开快照。
         """
-        with self._lock:
+        with self._state_lock:
             self._ensure_open()
 
             snap = Snapshot(
                 engine=self,
                 snapshot_id=self._next_snapshot_id,
-                # 内存表此刻的有序副本。list(...) 之后就是独立的一份了,
-                # 之后的 put/delete 改的是原 dict,碰不到它。
-                mem_items=list(self._memtable.items()),
+                # 内存表此刻的有序副本(活动表 + 不可变表)。
+                # 建列表之后就各自独立了,之后的 put/delete 改的是原 dict,
+                # 碰不到这一份。
+                mem_items=self._merged_mem_items_locked(),
                 # 传 manifest.levels 本身 —— Snapshot 内部会逐层复制。
                 levels=self._manifest.levels,
                 readers=self._readers,
@@ -784,6 +1078,25 @@ class LSMEngine:
             self._snapshots[snap.snapshot_id] = snap
             self._next_snapshot_id += 1
             return snap
+
+    def _merged_mem_items_locked(self) -> list[tuple[bytes, bytes | None]]:
+        """活动内存表 + 不可变内存表的合并视图,按 key 升序。**需持有 _state_lock**。
+
+        为什么要合并:不可变表**比所有 SSTable 都新** —— 它只是还没来得及
+        写成文件而已。快照只认这一份列表,漏掉不可变表,刷盘期间创建的快照
+        就会看不到那批刚写进去的数据(表现为"偶发少了几条",极难复现)。
+
+        同一个键两边都有时**活动表优先**,因为它更晚写。
+        """
+        active = list(self._memtable.items())
+        imm = self._immutable
+        if imm is None or len(imm) == 0:
+            return active
+
+        # 不可变表更旧,先铺底;活动表覆盖上去
+        merged: dict[bytes, bytes | None] = dict(imm.items())
+        merged.update(active)
+        return sorted(merged.items())
 
     def _pinned_file_ids(self) -> set[int]:
         """所有活快照引用到的文件 id 的并集。
@@ -802,7 +1115,7 @@ class LSMEngine:
         注意这里**不碰** ``self._readers`` —— 待删文件的 reader 早就被
         从里面摘掉了,它现在只活在 ``_pending_delete`` 和快照手里。
         """
-        with self._lock:
+        with self._state_lock:
             self._snapshots.pop(snap.snapshot_id, None)
             if not self._pending_delete:
                 return
@@ -842,13 +1155,21 @@ class LSMEngine:
         """
         kb = to_bytes(key, "key")
 
-        with self._lock:
+        with self._state_lock:
             self._ensure_open()
 
             # 内存表最新,先查它
             found, value = self._memtable.get_entry(kb)
             if found:
                 return (True, value)    # 可能是 None(墓碑)
+
+            # 其次是不可变内存表。它只在刷盘期间存在,但那一刻它比所有
+            # SSTable 都新 —— 漏掉这一层,刷盘期间就会"偶发查不到刚写的数据"。
+            imm = self._immutable
+            if imm is not None:
+                found, value = imm.get_entry(kb)
+                if found:
+                    return (True, value)
 
             found, value, rejections = search_levels(
                 self._manifest.levels, self._readers, kb
@@ -914,8 +1235,9 @@ class LSMEngine:
 
     def stats(self) -> EngineStats:
         """返回当前状态快照。"""
-        with self._lock:
+        with self._state_lock:
             files = self._manifest.files()
+            imm = self._immutable
             return EngineStats(
                 memtable_entries=len(self._memtable),
                 memtable_size=self._memtable.approximate_size,
@@ -923,6 +1245,9 @@ class LSMEngine:
                 tombstones=self._memtable.tombstone_count,
                 wal_size=self._wal.size,
                 flush_pending=self._memtable.is_full,
+                immutable_entries=0 if imm is None else len(imm),
+                immutable_bytes=0 if imm is None else imm.approximate_size,
+                wal_rewrites=self._wal_rewrite_count,
                 recovered_records=self._recovery.record_count,
                 recovery_truncated=self._recovery.truncated,
                 recovery_reason=self._recovery.reason,
@@ -982,7 +1307,7 @@ class LSMEngine:
     @property
     def snapshot_count(self) -> int:
         """当前活着的快照数。每个未耗尽的 ``scan()`` 迭代器算一个。"""
-        with self._lock:
+        with self._state_lock:
             return len(self._snapshots)
 
     @property
@@ -991,14 +1316,25 @@ class LSMEngine:
 
         它长期不空就说明有快照忘了关 —— 那批磁盘空间回收不了。
         """
-        with self._lock:
+        with self._state_lock:
             return sorted(self._pending_delete)
 
     @property
     def pinned_file_ids(self) -> list[int]:
         """当前被快照 pin 住的文件 id,升序。"""
-        with self._lock:
+        with self._state_lock:
             return sorted(self._pinned_file_ids())
+
+    @property
+    def immutable_entries(self) -> int:
+        """正在刷盘的那张不可变内存表里有多少条(没有则为 0)。
+
+        它**长期不为 0** 说明刷盘卡住了 —— 那期间写入都堆在活动内存表里,
+        而内存占用是平时的两倍。
+        """
+        with self._state_lock:
+            imm = self._immutable
+            return 0 if imm is None else len(imm)
 
     # ------------------------------------------------------------ 生命周期
 
@@ -1006,8 +1342,12 @@ class LSMEngine:
         """强制把 WAL 刷到磁盘。想扛断电就调用它。
 
         注意:内存表**不会**因为 sync 而落盘 —— 它的持久性由 WAL 保证。
+
+        这里用 ``_append_lock`` 而不是 ``_state_lock``:它保护的是写路径,
+        和"结构状态"无关;而且 fsync 是 I/O,不该占着 ``_state_lock`` 做,
+        否则一次 sync 会把所有读也一起挡住。
         """
-        with self._lock:
+        with self._append_lock:
             self._ensure_open()
             self._wal.sync()
 
@@ -1020,24 +1360,31 @@ class LSMEngine:
         已经发出去的快照会一并失效(再读会抛 ``ClosedError``),
         它们 pin 住的待删文件也在这里真正删掉 —— 引擎都关了,
         没有"还在读"的可能了。
+
+        三层锁按 ``maintenance → append → state`` 的顺序一次性全拿下来,
+        意义是:**等所有在飞的维护操作和写入都结束**,再动手清理。
+        特别是 ``_append_lock`` —— 拿到它就说明没有线程正追加到一半,
+        此后 ``_closed`` 置位,后续写入一律被 ``_ensure_open`` 挡掉。
         """
-        with self._lock:
-            if self._closed:
-                return
+        with self._maintenance_lock:
+            with self._append_lock:
+                with self._state_lock:
+                    if self._closed:
+                        return
 
-            # 先失效快照。注意用 _invalidate 而不是 close:后者会回调
-            # _release_snapshot,而这里正持着锁,重入容易出岔子。
-            for snap in list(self._snapshots.values()):
-                snap._invalidate()
-            self._snapshots.clear()
+                    # 先失效快照。注意用 _invalidate 而不是 close:后者会回调
+                    # _release_snapshot,而这里正持着锁,重入容易出岔子。
+                    for snap in list(self._snapshots.values()):
+                        snap._invalidate()
+                    self._snapshots.clear()
 
-            self._wal.close()
-            for reader in self._readers.values():
-                reader.close()
-            self._readers.clear()
+                    self._wal.close()
+                    for reader in self._readers.values():
+                        reader.close()
+                    self._readers.clear()
 
-            self._drain_pending_delete()
-            self._closed = True
+                    self._drain_pending_delete()
+                    self._closed = True
 
     def _ensure_open(self) -> None:
         if self._closed:
